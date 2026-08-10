@@ -1,0 +1,40 @@
+[
+  {
+    "Type": "Material",
+    "Name": "Material_018",
+    "Class": "Material",
+    "Package": "/Game/Characters/Fox/Materials/Material_018",
+    "Properties": {
+      "bUsedWithSkeletalMesh": true,
+      "BaseColor": { "OutputIndex": 0, "InputName": "BaseColor" },
+      "Roughness": { "OutputIndex": 0, "InputName": "Roughness" },
+      "Metallic": { "OutputIndex": 0, "InputName": "Metallic" }
+    },
+    "LoadedMaterialResources": [
+      {
+        "LoadedShaderMap": {
+          "Content": {
+            "MaterialCompilationOutput": {
+              "UniformExpressionSet": {
+                "UniformNumericParameters": [
+                  { "Name": "Intensity", "Type": "Scalar", "DefaultValue": 0.8 },
+                  { "Name": "FurTint", "Type": "Vector", "DefaultValue": { "R": 1.0, "G": 0.5, "B": 0.2, "A": 1.0 } }
+                ],
+                "UniformTextureParameters": [
+                  { "Name": "FurAlbedo", "DefaultValue": { "ObjectName": "Texture2D '/Game/Textures/T_FurAlbedo.T_FurAlbedo'", "ObjectPath": "/Game/Textures/T_FurAlbedo.T_FurAlbedo" } }
+                ],
+                "UniformBufferLayoutInitializer": { "Members": [], "Size": 64 }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "CachedExpressionData": {
+      "FunctionInfos": [
+        { "FunctionId": "11111111-1111-1111-1111-111111111111", "Function": { "ObjectName": "MaterialFunction '/Game/Functions/MF_PhongToMetalRoughness.MF_PhongToMetalRoughness'", "ObjectPath": "/Game/Functions/MF_PhongToMetalRoughness.MF_PhongToMetalRoughness" } }
+      ],
+      "PropertyConnectedMask": 12
+    }
+  }
+]

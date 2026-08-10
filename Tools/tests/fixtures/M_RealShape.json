@@ -1,0 +1,55 @@
+[
+  {
+    "Type": "Material",
+    "Name": "M_RealShape",
+    "Class": "Material",
+    "Package": "/Game/Test/M_RealShape",
+    "Properties": {
+      "BlendMode": "EBlendMode::BLEND_Masked",
+      "BaseColor": { "OutputIndex": 0, "InputName": "BaseColor" },
+      "OpacityMask": { "OutputIndex": 0, "InputName": "OpacityMask" },
+      "bUsedWithSkeletalMesh": true
+    },
+    "LoadedMaterialResources": [
+      {
+        "LoadedShaderMap": {
+          "Content": {
+            "MaterialCompilationOutput": {
+              "UniformExpressionSet": {
+                "UniformScalarParameters": [],
+                "UniformVectorParameters": [],
+                "UniformNumericParameters": [
+                  { "ParameterInfo": { "Name": "SelectionColor", "Index": -1, "Association": "GlobalParameter" }, "ParameterType": "Vector", "DefaultValueOffset": 0, "Value": { "R": 0.0, "G": 0.0, "B": 0.0, "A": 0.0, "Hex": "000000" } },
+                  { "ParameterInfo": { "Name": "Color main", "Index": -1, "Association": "GlobalParameter" }, "ParameterType": "Vector", "DefaultValueOffset": 16, "Value": { "R": 1.0, "G": 1.0, "B": 1.0, "A": 0.0, "Hex": "FFFFFF" } },
+                  { "ParameterInfo": { "Name": "WPO", "Index": -1, "Association": "GlobalParameter" }, "ParameterType": "Scalar", "DefaultValueOffset": 32, "Value": 0.2 }
+                ],
+                "UniformTextureParameters": [
+                  [
+                    { "TextureIndex": 2, "SamplerSource": "SSM_FromTextureAsset", "ParameterInfo": { "Name": "Color Map", "Index": -1, "Association": "GlobalParameter" }, "ParameterInfoOld": null, "ParameterName": null },
+                    { "TextureIndex": 0, "SamplerSource": "SSM_FromTextureAsset", "ParameterInfo": { "Name": "Alpha Map", "Index": -1, "Association": "GlobalParameter" }, "ParameterInfoOld": null, "ParameterName": null },
+                    { "TextureIndex": 3, "SamplerSource": "SSM_FromTextureAsset", "ParameterInfo": { "Name": "Alpha Upper", "Index": -1, "Association": "GlobalParameter" }, "ParameterInfoOld": null, "ParameterName": null }
+                  ],
+                  [],
+                  []
+                ],
+                "UniformBufferLayoutInitializer": { "Members": [], "Size": 64 }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "CachedExpressionData": {
+      "FunctionInfos": [
+        { "StateId": "71028A8D-47BF4037-3A3A0B8A-D7B60E53", "Function": { "ObjectName": "MaterialFunction 'MF_PhongToMetalRoughness'", "ObjectPath": "/Game/Functions/MF_PhongToMetalRoughness.0" } }
+      ],
+      "PropertyConnectedMask": 4582
+    },
+    "ReferencedTextures": [
+      { "ObjectName": "Texture2D 'BlackPlaceholder'", "ObjectPath": "/Bridge/MSPresets/MSTextures/BlackPlaceholder.0" },
+      { "ObjectName": "Texture2D 'Good64x64TilingNoiseHighFreq'", "ObjectPath": "/Engine/EngineMaterials/Good64x64TilingNoiseHighFreq.0" },
+      { "ObjectName": "Texture2D 'Bra_Sexy_001_Color'", "ObjectPath": "/Game/Character/Clothes/Underwears/Bra_Sexy_001_Color.0" },
+      { "ObjectName": "Texture2D 'Underwear_Sexy_001_Alpha'", "ObjectPath": "/Game/Character/Clothes/Underwears/Underwear_Sexy_001_Alpha.0" }
+    ]
+  }
+]

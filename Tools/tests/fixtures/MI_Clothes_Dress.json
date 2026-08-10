@@ -1,0 +1,26 @@
+[
+  {
+    "Type": "MaterialInstanceConstant",
+    "Name": "MI_Clothes_Dress",
+    "Outer": "/Game/Characters/Clothes",
+    "Class": "MaterialInstanceConstant",
+    "Properties": {
+      "Outer": { "ObjectName": "Package '/Game/Characters/Clothes'", "ObjectPath": "/Game/Characters/Clothes" },
+      "Parent": {
+        "ObjectName": "Material '/Game/Characters/Clothes/M_Clothes_Dress.M_Clothes_Dress'",
+        "ObjectPath": "/Game/Characters/Clothes/M_Clothes_Dress.M_Clothes_Dress",
+        "Outer": "/Game/Characters/Clothes"
+      },
+      "ScalarParameterValues": [
+        { "ParameterInfo": { "Name": "PatternScale", "Association": "GlobalParameter", "Index": 0 }, "ParameterValue": 0.3 }
+      ],
+      "VectorParameterValues": [
+        { "ParameterInfo": { "Name": "DressColor", "Association": "GlobalParameter", "Index": 0 }, "ParameterValue": { "R": 0.1, "G": 0.8, "B": 0.9, "A": 1.0 } }
+      ],
+      "TextureParameterValues": [
+        { "ParameterInfo": { "Name": "DressAlbedo", "Association": "GlobalParameter", "Index": 0 }, "ParameterValue": { "ObjectName": "Texture2D '/Game/Textures/T_Dress.T_Dress'", "ObjectPath": "/Game/Textures/T_Dress.T_Dress", "Outer": "/Game/Textures" } }
+      ],
+      "BasePropertyOverrides": { "BlendMode": "BLEND_Masked" }
+    }
+  }
+]

@@ -1,0 +1,3780 @@
+=== FILE: Source/Reflection/Private/Importers/Constructor/Asset.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Constructor/Asset.cpp b/Source/Reflection/Private/Importers/Constructor/Asset.cpp
+index f76585f..a37fb85 100644
+--- a/Source/Reflection/Private/Importers/Constructor/Asset.cpp
++++ b/Source/Reflection/Private/Importers/Constructor/Asset.cpp
+@@ -4,22 +4,30 @@
+ 
+ #include "Importers/Constructor/Importer.h"
+ 
+-#include "Importers/Types/Texture/TextureImporter.h"
+-#include "Importers/Types/Texture/TextureTypes.h"
++#include "Importers/Types/Texture/TextureCreator.h"
+ 
+ #include "Curves/CurveLinearColor.h"
+-#include "Engine/TextureLightProfile.h"
+ #include "Sound/SoundNode.h"
+ #include "Engine/SubsurfaceProfile.h"
+ #include "Materials/MaterialParameterCollection.h"
+ #include "Settings/ReflectionSettings.h"
+ #include "Dom/JsonObject.h"
+ 
++#include "HttpModule.h"
++
++/* AssetRegistryModule.h only moved under an AssetRegistry/ folder later on */
++#if UE4_25_BELOW
++#include "AssetRegistryModule.h"
++#else
++#include "AssetRegistry/AssetRegistryModule.h"
++#endif
+ #include "Engine/FontFace.h"
+ #include "Importers/Constructor/ImportReader.h"
+ #include "Importers/Constructor/Graph/SoundGraph.h"
++#include "Interfaces/IHttpResponse.h"
+ #include "Modules/Cloud/Cloud.h"
+ #include "Settings/Runtime.h"
++#include "Modules/Cloud/Remote.h"
+ 
+ /* CreateAssetPackage Implementations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
+@@ -166,21 +174,38 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
+ 		FText::FromString(Path)
+ 	));
+ 
+-	const bool IsTexture = FTextureTypes::IsSupported(Type);
++	/* Supported Texture Classes */
++	const bool IsTexture = Type ==
++		"Texture2D" ||
++		Type == "TextureRenderTarget2D" ||
++		Type == "TextureCube" ||
++		Type == "VolumeTexture" ||
++		Type == "TextureLightProfile";
+ 
+ 	FString GamePath = Path;
+ 
+ 	/* Supported Assets */
+ 	if (CanImport(Type, true) || IsTexture) {
+ 		if (IsTexture) {
+-			UTexture* Texture = nullptr;
++			UTexture* Texture;
++			const FString NewPath = RealPath;
++
++			FString RootName; {
++				NewPath.Split("/", nullptr, &RootName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
++				RootName.Split("/", &RootName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
++			}
++
++			/* Missing Plugin: Create it */
++			if (RootName != "Game" && RootName != "Engine" && GetPlugin(RootName) == nullptr) {
++				CreatePlugin(RootName);
++			}
+ 
+-			bSuccess = FTextureImport::FromCloud(RealPath, Path, Texture);
++			bSuccess = Construct_TypeTexture(NewPath, Path, Texture);
+ 			if (bSuccess) OutObject = Cast<T>(Texture);
+ 
+ 			return true;
+ 		}
+-
++		
+ 		const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(Path);
+ 		if (Response == nullptr || Path.IsEmpty()) return true;
+ 
+@@ -237,7 +262,136 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
+ 	return false;
+ }
+ 
+-/* Textures live in FTextureImport, this is the seam other tools still reach through */
++bool FAssetUtilities::Construct_TypeTexture(const FString& Path, const FString& FetchPath, UTexture*& OutTexture) {
++	if (Path.IsEmpty()) {
++		return false;
++	}
++
++	const TSharedPtr<FJsonObject> JsonObject = Cloud::Export::GetRawBlocking(FetchPath);
++	if (JsonObject == nullptr) {
++		return false;
++	}
++
++	TArray<TSharedPtr<FJsonValue>> Response = JsonObject->GetArrayField(TEXT("exports"));
++	if (Response.Num() == 0) {
++		return false;
++	}
++
++	const TSharedPtr<FJsonObject> JsonExport = Response[0]->AsObject();
++	const FString Type = JsonExport->GetStringField(TEXT("Type"));
++
++	bool IsVectorDisplacementMap = false;
++
++	if (JsonExport->HasField(TEXT("Properties"))) {
++		if (JsonExport->GetObjectField(TEXT("Properties"))->HasField(TEXT("CompressionSettings"))) {
++			IsVectorDisplacementMap =
++				JsonExport->GetObjectField(TEXT("Properties"))->GetStringField(TEXT("CompressionSettings")).Contains("TC_VectorDisplacementmap")
++				|| JsonExport->GetObjectField(TEXT("Properties"))->GetStringField(TEXT("CompressionSettings")).Contains("TC_HDR");
++		}
++	}
++	
++	TArray<uint8> Data = TArray<uint8>();
++	bool UseOctetStream = ShouldUseOctetStream(Type, IsVectorDisplacementMap);
++
++	/* ~~~~~~~~~~~~~~~ Download Texture Data ~~~~~~~~~~~~ */
++	if (Type != "TextureRenderTarget2D") {
++		const FReflectionHttpRequest HttpRequest = FHttpModule::Get().CreateRequest();
++
++		HttpRequest->SetURL(Cloud::URL + "/api/export?path=" + FetchPath);
++		HttpRequest->SetHeader("content-type", UseOctetStream ? "application/octet-stream" : "image/png");
++		HttpRequest->SetVerb(TEXT("GET"));
++
++		const FReflectionHttpResponse HttpResponse = FRemoteUtilities::ExecuteRequestBlocking(HttpRequest);
++
++		if (!HttpResponse.IsValid() || HttpResponse->GetResponseCode() != 200)
++			return false;
++
++		if (HttpResponse->GetContentType().StartsWith("application/json; charset=utf-8")) {
++			return false;
++		}
++
++		Data = HttpResponse->GetContent();
++		if (Data.Num() == 0) {
++			return false;
++		}
++	}
++
++	return Fast_Construct_TypeTexture(JsonExport, Path, Type, Data, OutTexture);
++}
++
+ bool FAssetUtilities::Fast_Construct_TypeTexture(const TSharedPtr<FJsonObject>& JsonExport, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture) {
+-	return FTextureImport::FromExport(JsonExport, Path, Type, Data, OutTexture);
++	const UReflectionSettings* Settings = GetSettings();
++	UTexture* Texture = nullptr;
++	
++	FString PackagePath;
++	FString AssetName; {
++		Path.Split(".", &PackagePath, &AssetName);
++	}
++
++	bool IsVectorDisplacementMap = false;
++
++	if (JsonExport->HasField(TEXT("Properties"))) {
++		if (JsonExport->GetObjectField(TEXT("Properties"))->HasField(TEXT("CompressionSettings"))) {
++			IsVectorDisplacementMap = JsonExport->GetObjectField(TEXT("Properties"))->GetStringField(TEXT("CompressionSettings")).Contains("TC_VectorDisplacementmap")
++				|| JsonExport->GetObjectField(TEXT("Properties"))->GetStringField(TEXT("CompressionSettings")).Contains("TC_HDR");
++		}
++	}
++	
++	bool UseOctetStream = ShouldUseOctetStream(Type, IsVectorDisplacementMap);
++	
++	FRRedirects::Redirect(PackagePath);
++
++	if (!PackagePath.StartsWith("/Game/") && !PackagePath.StartsWith("/Engine/")) {
++		FString PluginName;
++		PackagePath.Split("/", nullptr, &PluginName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
++		PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
++
++		if (GetPlugin(PluginName) == nullptr) {
++			CreatePlugin(PluginName);
++		}
++	}
++	
++	UPackage* Package = CreateAssetPackage(*PackagePath);
++	Package->FullyLoad();
++
++	FTextureCreatorUtilities TextureCreator = FTextureCreatorUtilities(AssetName, Path, Package, UseOctetStream);
++
++	if (Type == "Texture2D") {
++		TextureCreator.CreateTexture<UTexture2D>(Texture, Data, JsonExport);
++	}
++	if (Type == "TextureLightProfile") {
++		TextureCreator.CreateTexture<UTextureLightProfile>(Texture, Data, JsonExport);
++	}
++	if (Type == "TextureCube") {
++		TextureCreator.CreateTextureCube(Texture, Data, JsonExport);
++	}
++	if (Type == "VolumeTexture") {
++		TextureCreator.CreateVolumeTexture(Texture, Data, JsonExport);
++	}
++	if (Type == "TextureRenderTarget2D") {
++		TextureCreator.CreateRenderTarget2D(Texture, JsonExport->GetObjectField(TEXT("Properties")));
++	}
++
++	if (Texture == nullptr) {
++		return false;
++	}
++
++	FAssetRegistryModule::AssetCreated(Texture);
++	if (!Texture->MarkPackageDirty()) {
++		return false;
++	}
++
++	Package->SetDirtyFlag(true);
++	Texture->PostEditChange();
++	Texture->AddToRoot();
++	Package->FullyLoad();
++
++	/* Save texture */
++	if (Settings->AssetSettings.SaveAssets) {
++		SavePackage(Package);
++	}
++
++	OutTexture = Texture;
++
++	return true;
+ }
+=== FILE: Source/Reflection/Private/Importers/Constructor/ImportReader.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Constructor/ImportReader.cpp b/Source/Reflection/Private/Importers/Constructor/ImportReader.cpp
+index 94f854f..71bd3e3 100644
+--- a/Source/Reflection/Private/Importers/Constructor/ImportReader.cpp
++++ b/Source/Reflection/Private/Importers/Constructor/ImportReader.cpp
+@@ -123,6 +123,11 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
+ 		Importer = new ITemplatedImporter<UObject>();
+ 	}
+ 
++	/* TODO: Don't hardcode this. */
++	if (ImportTypes::Cloud::Extra.Contains(Type)) {
++		Importer = new ITextureImporter<UTextureLightProfile>();
++	}
++
+ 	Export->Package = LocalPackage;
+ 	Importer->Initialize(Export, Container);
+ 
+=== FILE: Source/Reflection/Private/Importers/Constructor/Types.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Constructor/Types.cpp b/Source/Reflection/Private/Importers/Constructor/Types.cpp
+index cd0221a..cb427b5 100644
+--- a/Source/Reflection/Private/Importers/Constructor/Types.cpp
++++ b/Source/Reflection/Private/Importers/Constructor/Types.cpp
+@@ -104,6 +104,10 @@ bool ImportTypes::Cloud::Allowed(const FString& Type) {
+ 		return false;
+ 	}
+ 
++	if (Extra.Contains(Type)) {
++		return true;
++	}
++
+ 	return true;
+ }
+ 
+=== FILE: Source/Reflection/Private/Importers/Constructor/TypesHelper.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Constructor/TypesHelper.cpp b/Source/Reflection/Private/Importers/Constructor/TypesHelper.cpp
+index cf85e1c..832987f 100644
+--- a/Source/Reflection/Private/Importers/Constructor/TypesHelper.cpp
++++ b/Source/Reflection/Private/Importers/Constructor/TypesHelper.cpp
+@@ -34,7 +34,11 @@ bool CanImport(const FString& Type, const bool IsCloud, const UClass* Class) {
+ 	if (Class == nullptr) {
+ 		return false;
+ 	}
+-	
++
++	if (ImportTypes::Cloud::Extra.Contains(Type)) {
++		return true;
++	}
++
+ 	if (!ImportTypes::Allowed(Type)) return false;
+ 	
+ 	if (Class->IsChildOf(UDataAsset::StaticClass())) {
+=== FILE: Source/Reflection/Private/Importers/Types/Animation/PoseAssetImporter.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Animation/PoseAssetImporter.cpp b/Source/Reflection/Private/Importers/Types/Animation/PoseAssetImporter.cpp
+index 35d05c9..cfd67b2 100644
+--- a/Source/Reflection/Private/Importers/Types/Animation/PoseAssetImporter.cpp
++++ b/Source/Reflection/Private/Importers/Types/Animation/PoseAssetImporter.cpp
+@@ -1,23 +1,7 @@
+ /* Copyright Reflection Contributors 2024-2026 */
+ 
+ #include "Importers/Types/Animation/PoseAssetImporter.h"
+-#include "Animation/AnimSequence.h"
+ #include "Animation/PoseAsset.h"
+-#include "Engine/EngineUtilities.h"
+-
+-/* AssetRegistryModule.h only moved under an AssetRegistry/ folder later on */
+-#if UE4_25_BELOW
+-#include "AssetRegistryModule.h"
+-#else
+-#include "AssetRegistry/AssetRegistryModule.h"
+-#endif
+-
+-#if ENGINE_UE5 && ENGINE_MINOR_VERSION >= 2
+-#include "Animation/AnimData/IAnimationDataController.h"
+-#endif
+-
+-#include "Modules/Cloud/Cloud.h"
+-#include "Modules/Cloud/Remote.h"
+ #include "Utilities/JsonHelpers.h"
+ 
+ UObject* IPoseAssetImporter::CreateAsset(UObject* CreatedAsset) {
+@@ -27,7 +11,7 @@ UObject* IPoseAssetImporter::CreateAsset(UObject* CreatedAsset) {
+ bool IPoseAssetImporter::Import() {
+ 	PoseAsset = Create<UPoseAsset>();
+ 
+-	/* Set Skeleton, so we can use it in the de-cooking process */
++	/* Set Skeleton, so we can use it in the decooking process */
+ 	GetObjectSerializer()->DeserializeObjectProperties(KeepPropertiesShared(GetAssetData(),
+ 	{
+ 		"Skeleton",
+@@ -59,68 +43,17 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 	
+ 	const TSharedPtr<FJsonObject> PoseContainer = GetAssetData()->GetObjectField(TEXT("PoseContainer"));
+ 	const TArray<TSharedPtr<FJsonValue>> TracksJson = PoseContainer->GetArrayField(TEXT("Tracks"));
+-
+-	/* Guarded rather than assumed, GetArrayField is fatal on a missing field */
+-	TArray<TSharedPtr<FJsonValue>> PosesJson; {
+-		if (PoseContainer->HasField(TEXT("Poses"))) {
+-			PosesJson = PoseContainer->GetArrayField(TEXT("Poses"));
+-		}
+-	}
++	const TArray<TSharedPtr<FJsonValue>> PosesJson = PoseContainer->GetArrayField(TEXT("Poses"));
+ 
+ 	const int32 NumTracks = TracksJson.Num();
+ 
+-	/* Which pose holds which track, the way 5.x cooks it.
+-	 *
+-	 * TrackPoseInfluenceIndices[Track] lists every pose that moves that track, as a pose index
+-	 * paired with the slot the transform sits in inside that pose's LocalSpacePose. Older data
+-	 * carried the same mapping the other way round, per pose, as TrackToBufferIndex. */
+-	TMap<int32, TMap<int32, int32>> PoseToTrackBuffer; {
+-		if (PoseContainer->HasField(TEXT("TrackPoseInfluenceIndices"))) {
+-			const TArray<TSharedPtr<FJsonValue>> InfluenceIndicesJson = PoseContainer->GetArrayField(TEXT("TrackPoseInfluenceIndices"));
+-
+-			for (int32 TrackIndex = 0; TrackIndex < InfluenceIndicesJson.Num(); TrackIndex++) {
+-				const TSharedPtr<FJsonObject> InfluencesObject = InfluenceIndicesJson[TrackIndex]->AsObject();
+-				if (!InfluencesObject.IsValid() || !InfluencesObject->HasField(TEXT("Influences"))) continue;
+-
+-				for (const TSharedPtr<FJsonValue>& InfluenceValue : InfluencesObject->GetArrayField(TEXT("Influences"))) {
+-					const TSharedPtr<FJsonObject> Influence = InfluenceValue->AsObject();
+-					if (!Influence.IsValid()) continue;
+-
+-					int32 PoseIndex = INDEX_NONE;
+-					int32 BoneTransformIndex = INDEX_NONE;
+-
+-					if (!Influence->TryGetNumberField(TEXT("PoseIndex"), PoseIndex)) continue;
+-					if (!Influence->TryGetNumberField(TEXT("BoneTransformIndex"), BoneTransformIndex)) continue;
+-
+-					PoseToTrackBuffer.FindOrAdd(PoseIndex).Add(TrackIndex, BoneTransformIndex);
+-				}
+-			}
+-		}
+-	}
+-
+-	/* The reference pose the difference was cooked against, by name rather than by bone order */
+-	const TMap<FName, FTransform> CookedReferencePose = GetCookedReferencePose();
+-
+-	/* Curves have a cooked and a source side just like the transforms do, and the engine reads the
+-	 * source one back when it rebuilds an additive pose:
+-	 *
+-	 *     GetBasePoseTransform  -> OutCurve = Poses[BasePoseIndex].SourceCurveData
+-	 *     ConvertToAdditivePose -> check(InBaseCurve.Num() == Curves.Num())
+-	 *
+-	 * Leaving it empty trips that check during PostLoad, so it is filled from the cooked side. */
+-	int32 NumCurves = 0; {
+-		if (PoseContainer->HasField(TEXT("Curves"))) {
+-			NumCurves = PoseContainer->GetArrayField(TEXT("Curves")).Num();
+-		}
+-	}
+-
+-	for (int32 PoseIndex = 0; PoseIndex < PosesJson.Num(); PoseIndex++) {
+-		TSharedPtr<FJsonObject> Pose = PosesJson[PoseIndex]->AsObject();
+-
++	for (TSharedPtr<FJsonValue> PoseValue : PosesJson) {
++		TSharedPtr<FJsonObject> Pose = PoseValue->AsObject();
++		
+ 		if (!Pose.IsValid()) {
+ 			continue;
+ 		}
+-
++		
+ 		/* Read the optimized LocalSpacePose array */
+ 		TArray<TSharedPtr<FJsonValue>> LocalSpacePoseJson; {
+ 			if (Pose->HasField(TEXT("LocalSpacePose"))) {
+@@ -130,19 +63,16 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 
+ 		/* Build a mapping from track index (as int32) to index into LocalSpacePose. */
+ 		TMap<int32, int32> TrackToBufferIndex; {
+-			if (const TMap<int32, int32>* Influences = PoseToTrackBuffer.Find(PoseIndex)) {
+-				TrackToBufferIndex = *Influences;
+-			}
+-			else if (Pose->HasField(TEXT("TrackToBufferIndex"))) {
++			if (Pose->HasField(TEXT("TrackToBufferIndex"))) {
+ 				const TArray<TSharedPtr<FJsonValue>> TrackToBufferJson = Pose->GetArrayField(TEXT("TrackToBufferIndex"));
+-
++			
+ 				for (TSharedPtr<FJsonValue> TrackToBuffer : TrackToBufferJson) {
+ 					const TSharedPtr<FJsonObject> TrackToBufferObject = TrackToBuffer->AsObject();
+-
++				
+ 					if (TrackToBufferObject.IsValid()) {
+ 						int32 Key = FCString::Atoi(*TrackToBufferObject->GetStringField(TEXT("Key")));
+ 						int32 Value = FCString::Atoi(*TrackToBufferObject->GetStringField(TEXT("Value")));
+-
++					
+ 						TrackToBufferIndex.Add(Key, Value);
+ 					}
+ 				}
+@@ -154,21 +84,15 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 		SourceLocalSpacePose.SetNum(NumTracks);
+ 
+ 		for (int32 i = 0; i < NumTracks; i++) {
+-			const FName TrackName = FName(*TracksJson[i]->AsString());
+-
+ 			/* DefaultTransform can either be default, or extracted from the base skeleton */
+ 			FTransform DefaultTransform = FTransform::Identity; {
+-				if (const FTransform* CookedTransform = CookedReferencePose.Find(TrackName)) {
+-					DefaultTransform = *CookedTransform;
+-				}
+-				else if (Skeleton) {
+-					/* Cloud had nothing to say about this bone, so the project's skeleton stands in */
++				if (Skeleton) {
+ 					const FReferenceSkeleton& ReferenceSkeleton = Skeleton->GetReferenceSkeleton();
+-					const int32 BoneIndex = ReferenceSkeleton.FindBoneIndex(TrackName);
+-
++					const int32 BoneIndex = ReferenceSkeleton.FindBoneIndex(FName(*TracksJson[i]->AsString()));
++				
+ 					if (BoneIndex != INDEX_NONE) {
+ 						const TArray<FTransform> ReferencePose = Skeleton->GetRefLocalPoses();
+-
++					
+ 						if (ReferencePose.IsValidIndex(BoneIndex)) {
+ 							DefaultTransform = ReferencePose[BoneIndex];
+ 						}
+@@ -179,16 +103,11 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 			/* If a track is found, combine the transform data together (the engine cooks only the difference between the reference skeleton and the pose) */
+ 			if (TrackToBufferIndex.Contains(i)) {
+ 				const int32 LocalIndex = TrackToBufferIndex[i];
+-
++				
+ 				if (LocalSpacePoseJson.IsValidIndex(LocalIndex)) {
+-					/* Falls through to the reference transform below rather than skipping the
+-					 * track, a hole here is a null entry that whoever reads the array walks into */
+ 					const TSharedPtr<FJsonObject> AdditiveJson = LocalSpacePoseJson[LocalIndex]->AsObject();
+-					if (!AdditiveJson.IsValid()) {
+-						SourceLocalSpacePose[i] = MakeShareable(new FJsonValueObject(GetTransformJson(DefaultTransform)));
+-						continue;
+-					}
+-
++					if (!AdditiveJson.IsValid()) continue;
++					
+ 					const FTransform AdditiveTransform = GetTransformFromJson(AdditiveJson);
+ 
+ 					FTransform FullTransform = DefaultTransform; {
+@@ -215,26 +134,6 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 
+ 		/* Update the Pose with SourceLocalSpacePose */
+ 		Pose->SetArrayField(TEXT("SourceLocalSpacePose"), SourceLocalSpacePose);
+-
+-		/* And the curves alongside them, sized to the container's curve list either way */
+-		TArray<TSharedPtr<FJsonValue>> SourceCurveData;
+-		SourceCurveData.Reserve(NumCurves);
+-
+-		if (Pose->HasField(TEXT("CurveData"))) {
+-			SourceCurveData = Pose->GetArrayField(TEXT("CurveData"));
+-		}
+-
+-		if (SourceCurveData.Num() != NumCurves) {
+-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" pose %d carries %d curve values for %d curves, padding to match"), *GetAssetName(), PoseIndex, SourceCurveData.Num(), NumCurves);
+-
+-			while (SourceCurveData.Num() < NumCurves) {
+-				SourceCurveData.Add(MakeShareable(new FJsonValueNumber(0.0)));
+-			}
+-
+-			SourceCurveData.SetNum(NumCurves);
+-		}
+-
+-		Pose->SetArrayField(TEXT("SourceCurveData"), SourceCurveData);
+ 	}
+ 
+ 	FString CleanName = GetAssetName();
+@@ -267,225 +166,69 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) const {
+ 	}
+ }
+ 
+-TMap<FName, FTransform> IPoseAssetImporter::GetCookedReferencePose() const {
+-	TMap<FName, FTransform> ReferencePose;
+-
+-	const TSharedPtr<FJsonObject>* SkeletonReference;
+-	if (!GetAssetData()->TryGetObjectField(TEXT("Skeleton"), SkeletonReference)) {
+-		return ReferencePose;
+-	}
+-
+-	FString SkeletonPath;
+-	if (!(*SkeletonReference)->TryGetStringField(TEXT("ObjectPath"), SkeletonPath) || SkeletonPath.IsEmpty()) {
+-		return ReferencePose;
+-	}
+-
+-	/* Cloud cuts the export index off itself, but the path has to match what it indexes on */
+-	int32 Dot;
+-	if (SkeletonPath.FindLastChar(TEXT('.'), Dot)) {
+-		SkeletonPath.LeftInline(Dot);
+-	}
+-
+-	const FBlockingRequestScope BlockingScope(FText::Format(
+-		NSLOCTEXT("Reflection", "FetchingSkeleton", "Reading reference pose from {0}"),
+-		FText::FromString(SkeletonPath)
+-	));
+-
+-	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(SkeletonPath);
+-	if (Response == nullptr || !Response->HasField(TEXT("exports"))) {
+-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" could not read \"%s\" from Cloud, falling back to the skeleton in the project"), *GetAssetName(), *SkeletonPath);
+-
+-		return ReferencePose;
+-	}
+-
+-	for (const TSharedPtr<FJsonValue>& ExportValue : Response->GetArrayField(TEXT("exports"))) {
+-		const TSharedPtr<FJsonObject> Export = ExportValue->AsObject();
+-
+-		FString Type;
+-		if (!Export.IsValid() || !Export->TryGetStringField(TEXT("Type"), Type) || Type != TEXT("Skeleton")) {
+-			continue;
+-		}
+-
+-		const TSharedPtr<FJsonObject>* Properties;
+-		if (!Export->TryGetObjectField(TEXT("Properties"), Properties)) continue;
+-
+-		const TSharedPtr<FJsonObject>* ReferenceSkeleton;
+-		if (!(*Properties)->TryGetObjectField(TEXT("ReferenceSkeleton"), ReferenceSkeleton)) continue;
+-
+-		const TArray<TSharedPtr<FJsonValue>>* BoneInfo;
+-		const TArray<TSharedPtr<FJsonValue>>* BonePose;
+-
+-		if (!(*ReferenceSkeleton)->TryGetArrayField(TEXT("FinalRefBoneInfo"), BoneInfo)) continue;
+-		if (!(*ReferenceSkeleton)->TryGetArrayField(TEXT("FinalRefBonePose"), BonePose)) continue;
+-
+-		/* Two parallel arrays, so a bone is only usable when both sides have it */
+-		for (int32 BoneIndex = 0; BoneIndex < BoneInfo->Num() && BoneIndex < BonePose->Num(); BoneIndex++) {
+-			const TSharedPtr<FJsonObject> Bone = (*BoneInfo)[BoneIndex]->AsObject();
+-			const TSharedPtr<FJsonObject> Transform = (*BonePose)[BoneIndex]->AsObject();
+-
+-			if (!Bone.IsValid() || !Transform.IsValid()) continue;
+-
+-			FString BoneName;
+-			if (!Bone->TryGetStringField(TEXT("Name"), BoneName)) continue;
+-
+-			ReferencePose.Add(FName(*BoneName), GetTransformFromJson(Transform));
+-		}
+-
+-		break;
+-	}
+-
+-	return ReferencePose;
+-}
+-
+ UAnimSequence* IPoseAssetImporter::CreateAnimSequenceFromPose(USkeleton* Skeleton, const FString& SequenceName, const TSharedPtr<FJsonObject>& PoseContainer, UPackage* Outer) {
+-	if (!Skeleton || !PoseContainer.IsValid() || Outer == nullptr) {
++#if ENGINE_UE4
++	if (!Skeleton || !PoseContainer.IsValid()) {
+ 		return nullptr;
+ 	}
+ 
+-	const TArray<TSharedPtr<FJsonValue>>* TracksJson;
+-	const TArray<TSharedPtr<FJsonValue>>* PosesJson;
+-
+-	if (!PoseContainer->TryGetArrayField(TEXT("Tracks"), TracksJson)) return nullptr;
+-	if (!PoseContainer->TryGetArrayField(TEXT("Poses"), PosesJson)) return nullptr;
+-
+-	/* One frame per pose, one track per bone */
+-	const int32 NumFrames = PosesJson->Num();
+-	const int32 NumTracks = TracksJson->Num();
++	const TArray<TSharedPtr<FJsonValue>> TracksJson = PoseContainer->GetArrayField(TEXT("Tracks"));
++	const TArray<TSharedPtr<FJsonValue>> PosesJson = PoseContainer->GetArrayField(TEXT("Poses"));
++	const int32 NumFrames = PosesJson.Num();
++	const int32 NumTracks = TracksJson.Num();
+ 
+ 	if (NumFrames == 0 || NumTracks == 0) {
+ 		return nullptr;
+ 	}
+ 
+-	/* Every track gets a key on every frame, even where the pose had nothing to say about it.
+-	 * The keys are positional, so a track that skips a frame is not a track missing one value,
+-	 * it is a track whose every later key belongs to the wrong frame. */
+-	TArray<FName> BoneNames;
+-	TArray<TArray<FVector>> PositionKeys;
+-	TArray<TArray<FQuat>> RotationKeys;
+-	TArray<TArray<FVector>> ScaleKeys;
+-
+-	TArray<int32> TrackToBone;
+-	TrackToBone.Init(INDEX_NONE, NumTracks);
+-
+-	int32 SkippedTracks = 0;
+-
+-	for (int32 TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++) {
+-		const FName BoneName(*(*TracksJson)[TrackIndex]->AsString());
+-
+-		/* A track the project's skeleton has no bone for has nowhere to go */
+-		if (Skeleton->GetReferenceSkeleton().FindBoneIndex(BoneName) == INDEX_NONE) {
+-			SkippedTracks++;
+-			continue;
+-		}
+-
+-		TrackToBone[TrackIndex] = BoneNames.Add(BoneName);
+-
+-		PositionKeys.AddDefaulted();
+-		RotationKeys.AddDefaulted();
+-		ScaleKeys.AddDefaulted();
+-
+-		PositionKeys.Last().Reserve(NumFrames);
+-		RotationKeys.Last().Reserve(NumFrames);
+-		ScaleKeys.Last().Reserve(NumFrames);
+-	}
+-
+-	if (BoneNames.Num() == 0) {
+-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" has no track the skeleton \"%s\" recognises, skipping the animation"), *SequenceName, *Skeleton->GetName());
+-
+-		return nullptr;
+-	}
+-
+-	if (SkippedTracks > 0) {
+-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" left out %d of %d tracks, \"%s\" has no bone by those names"), *SequenceName, SkippedTracks, NumTracks, *Skeleton->GetName());
+-	}
+-
+-	for (int32 FrameIndex = 0; FrameIndex < NumFrames; FrameIndex++) {
+-		const TSharedPtr<FJsonObject> Pose = (*PosesJson)[FrameIndex]->AsObject();
+-
+-		/* Written by ReverseCookLocalSpacePose, absent on any pose it couldn't read */
+-		const TArray<TSharedPtr<FJsonValue>>* SourceLocalSpacePose = nullptr;
+-		if (Pose.IsValid()) {
+-			Pose->TryGetArrayField(TEXT("SourceLocalSpacePose"), SourceLocalSpacePose);
+-		}
+-
+-		for (int32 TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++) {
+-			const int32 BoneIndex = TrackToBone[TrackIndex];
+-			if (BoneIndex == INDEX_NONE) continue;
++	UAnimSequence* AnimSequence = NewObject<UAnimSequence>(Outer, FName(*SequenceName), RF_Public | RF_Standalone);
++	AnimSequence->SetSkeleton(Skeleton);
+ 
+-			FTransform Transform = FTransform::Identity;
++	AnimSequence->SetRawNumberOfFrame(NumFrames);
++	AnimSequence->SequenceLength = (NumFrames > 1) ? static_cast<float>(NumFrames - 1) : 1.0f;
++	
++	TMap<FName, FRawAnimSequenceTrack> TrackMap; {
++		for (int32 TrackIndex = 0; TrackIndex < NumTracks; ++TrackIndex) {
++			const FString TrackName = TracksJson[TrackIndex]->AsString();
+ 
+-			if (SourceLocalSpacePose != nullptr && SourceLocalSpacePose->IsValidIndex(TrackIndex) && (*SourceLocalSpacePose)[TrackIndex].IsValid()) {
+-				if (const TSharedPtr<FJsonObject> TransformJson = (*SourceLocalSpacePose)[TrackIndex]->AsObject()) {
+-					Transform = GetTransformFromJson(TransformJson);
+-				}
++			if (const FName BoneName(*TrackName); Skeleton->GetReferenceSkeleton().FindBoneIndex(BoneName) != INDEX_NONE) {
++				TrackMap.Add(BoneName, FRawAnimSequenceTrack());
+ 			}
+-
+-			PositionKeys[BoneIndex].Add(Transform.GetTranslation());
+-			RotationKeys[BoneIndex].Add(Transform.GetRotation());
+-			ScaleKeys[BoneIndex].Add(Transform.GetScale3D());
+ 		}
+ 	}
+ 
+-	UAnimSequence* AnimSequence = NewObject<UAnimSequence>(Outer, FName(*SequenceName), RF_Public | RF_Standalone | RF_Transactional);
+-	AnimSequence->SetSkeleton(Skeleton);
++	for (int32 FrameIndex = 0; FrameIndex < NumFrames; ++FrameIndex) {
++		const TSharedPtr<FJsonObject> Pose = PosesJson[FrameIndex]->AsObject();
++		if (!Pose.IsValid()) continue;
+ 
+-	/* A pose asset has no timing of its own, so the poses are laid out one per frame at a rate
+-	 * that makes each of them land on a whole frame */
+-	constexpr int32 FrameRate = 30;
++		const TArray<TSharedPtr<FJsonValue>> SourceLocalSpacePose = Pose->GetArrayField(TEXT("SourceLocalSpacePose"));
++		
++		for (int32 TrackIndex = 0; TrackIndex < NumTracks; ++TrackIndex) {
++			const FString TrackName = TracksJson[TrackIndex]->AsString();
++			const FName BoneName(*TrackName);
+ 
+-/* 5.2 is where raw animation data moved behind the data model and its controller */
+-#if ENGINE_UE5 && ENGINE_MINOR_VERSION >= 2
+-	IAnimationDataController& Controller = AnimSequence->GetController();
++			if (!TrackMap.Contains(BoneName)) continue;
+ 
+-	Controller.OpenBracket(NSLOCTEXT("Reflection", "BuildPoseAnimation", "Building pose animation"), false);
+-	Controller.InitializeModel();
++			const TSharedPtr<FJsonObject> TransformJson = SourceLocalSpacePose[TrackIndex]->AsObject();
++			if (!TransformJson.IsValid()) continue;
+ 
+-	Controller.SetFrameRate(FFrameRate(FrameRate, 1), false);
+-	Controller.SetNumberOfFrames(FFrameNumber(FMath::Max(1, NumFrames - 1)), false);
++			const FTransform Transform = GetTransformFromJson(TransformJson);
+ 
+-	for (int32 BoneIndex = 0; BoneIndex < BoneNames.Num(); BoneIndex++) {
+-		Controller.AddBoneCurve(BoneNames[BoneIndex], false);
+-		Controller.SetBoneTrackKeys(BoneNames[BoneIndex], PositionKeys[BoneIndex], RotationKeys[BoneIndex], ScaleKeys[BoneIndex], false);
++			auto& [PosKeys, RotKeys, ScaleKeys] = TrackMap[BoneName];
++			PosKeys.Add(Transform.GetTranslation());
++			RotKeys.Add(Transform.GetRotation());
++			ScaleKeys.Add(Transform.GetScale3D());
++		}
+ 	}
+ 
+-	Controller.NotifyPopulated();
+-	Controller.CloseBracket(false);
+-#elif ENGINE_UE4
+-	AnimSequence->SetRawNumberOfFrame(NumFrames);
+-	AnimSequence->SequenceLength = NumFrames > 1 ? static_cast<float>(NumFrames - 1) / FrameRate : 1.0f;
+-
+-	for (int32 BoneIndex = 0; BoneIndex < BoneNames.Num(); BoneIndex++) {
+-		FRawAnimSequenceTrack Track;
+-
+-		Track.PosKeys = PositionKeys[BoneIndex];
+-		Track.RotKeys = RotationKeys[BoneIndex];
+-		Track.ScaleKeys = ScaleKeys[BoneIndex];
+-
+-		AnimSequence->AddNewRawTrack(BoneNames[BoneIndex], &Track);
++	for (TPair<FName, FRawAnimSequenceTrack>& Pair : TrackMap) {
++		AnimSequence->AddNewRawTrack(Pair.Key, &Pair.Value);
+ 	}
+ 
+ 	AnimSequence->PostProcessSequence();
++	
++	return AnimSequence;
+ #else
+-	/* 5.0 and 5.1 have the data model but not the controller surface used above */
+-	UE_LOG(LogReflection, Warning, TEXT("\"%s\" cannot be built on this engine version"), *SequenceName);
+-
+ 	return nullptr;
+ #endif
+-
+-	/* Without this the sequence exists but never shows up in the Content Browser */
+-	FAssetRegistryModule::AssetCreated(AnimSequence);
+-
+-	AnimSequence->PostEditChange();
+-	AnimSequence->MarkPackageDirty();
+-
+-	Outer->FullyLoad();
+-	Outer->SetDirtyFlag(true);
+-
+-	if (GetSettings()->AssetSettings.SaveAssets) {
+-		SavePackage(Outer);
+-	}
+-
+-	UE_LOG(LogReflection, Log, TEXT("Built \"%s\" from %d poses over %d tracks"), *SequenceName, NumFrames, BoneNames.Num());
+-
+-	return AnimSequence;
+ }
+=== FILE: Source/Reflection/Private/Importers/Types/Blueprint/AnimationBlueprintImporter.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Blueprint/AnimationBlueprintImporter.cpp b/Source/Reflection/Private/Importers/Types/Blueprint/AnimationBlueprintImporter.cpp
+index 784b2b6..a513453 100644
+--- a/Source/Reflection/Private/Importers/Types/Blueprint/AnimationBlueprintImporter.cpp
++++ b/Source/Reflection/Private/Importers/Types/Blueprint/AnimationBlueprintImporter.cpp
+@@ -17,7 +17,6 @@
+ #include "Importers/Types/Blueprint/Utilities/StateMachineUtilities.h"
+ #include "Kismet2/KismetEditorUtilities.h"
+ #include "Importers/Types/Blueprint/BlueprintUtilities.h"
+-#include "Importers/Types/Blueprint/BlueprintVariables.h"
+ #include "Utilities/JsonHelpers.h"
+ 
+ #if ENGINE_UE5
+@@ -72,18 +71,6 @@ bool IAnimationBlueprintImporter::Import() {
+ 	RootAnimNodeProperties = RootAnimNodeDefaults->GetObjectField(TEXT("Properties"));
+ 	if (!RootAnimNodeProperties.IsValid()) return false;
+ 
+-	/*
+-	 * The variables the blueprint declares have to exist before the class default object below can
+-	 * put anything in them. ChildProperties holds them alongside the anim graph node state, which
+-	 * FBlueprintVariables filters out.
+-	 */
+-	if (const TArray<TSharedPtr<FJsonValue>>* ChildProperties; GetAssetExport()->TryGetArrayField(TEXT("ChildProperties"), ChildProperties)) {
+-		if (FBlueprintVariables::Construct(AnimBlueprint, *ChildProperties) > 0) {
+-			/* The properties only appear on the generated class once it recompiles */
+-			FKismetEditorUtilities::CompileBlueprint(AnimBlueprint, EBlueprintCompileOptions::SkipGarbageCollection);
+-		}
+-	}
+-
+ 	/* UClass::GetDefaultObject only became const later on */
+ #if UE4_24_BELOW
+ 	UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(AnimBlueprint->GeneratedClass);
+=== FILE: Source/Reflection/Private/Importers/Types/Blueprint/BlueprintImporter.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintImporter.cpp b/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintImporter.cpp
+index 678f53c..dc43a42 100644
+--- a/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintImporter.cpp
++++ b/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintImporter.cpp
+@@ -19,7 +19,6 @@
+ 
+ #include "Engine/SCS_Node.h"
+ #include "Importers/Types/Blueprint/BlueprintUtilities.h"
+-#include "Importers/Types/Blueprint/BlueprintVariables.h"
+ 
+ UObject* IBlueprintImporter::CreateAsset(UObject* CreatedAsset) {
+ 	UClass* Class = GetAssetClass();
+@@ -90,21 +89,6 @@ bool IBlueprintImporter::Import() {
+ 
+ 	ClassDefaultObjectExport->Object = GeneratedClass;
+ 
+-	/* The variables have to exist before their defaults can land anywhere. A recreated blueprint
+-	 * only has what its parent class gave it, so any property the blueprint declared itself is
+-	 * missing, and deserializing the class default object over it would drop those values on the
+-	 * floor without complaining. */
+-	if (ConstructVariables() > 0) {
+-		/* Adding a variable only touches the blueprint, the generated class grows the property
+-		 * when it recompiles, and the default object below is the one that comes out of that */
+-		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
+-
+-		GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass);
+-		if (!GeneratedClass) return false;
+-
+-		ClassDefaultObjectExport->Object = GeneratedClass;
+-	}
+-
+ 	GetObjectSerializer()->DeserializeObjectProperties(ClassDefaultObjectExport->GetProperties(), GeneratedClass->GetDefaultObject());
+ 
+ 	/* Experimental (for now) spawning */
+@@ -116,17 +100,6 @@ bool IBlueprintImporter::Import() {
+ 	return OnAssetCreation(Blueprint);
+ }
+ 
+-int32 IBlueprintImporter::ConstructVariables() {
+-	const TArray<TSharedPtr<FJsonValue>>* ChildProperties;
+-
+-	/* A blueprint that declared nothing of its own has no ChildProperties at all */
+-	if (!GetAssetExport()->TryGetArrayField(TEXT("ChildProperties"), ChildProperties)) {
+-		return 0;
+-	}
+-
+-	return FBlueprintVariables::Construct(Blueprint, *ChildProperties);
+-}
+-
+ void IBlueprintImporter::ConstructScript() const {
+ 	if (!GetAssetDataAsValue().Has("SimpleConstructionScript")) return;
+ 	
+=== FILE: Source/Reflection/Private/Importers/Types/Blueprint/BlueprintVariables.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintVariables.cpp b/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintVariables.cpp
+deleted file mode 100644
+index bb281f9..0000000
+--- a/Source/Reflection/Private/Importers/Types/Blueprint/BlueprintVariables.cpp
++++ /dev/null
+@@ -1,258 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Importers/Types/Blueprint/BlueprintVariables.h"
+-
+-#include "Engine/EngineUtilities.h"
+-#include "Utilities/JsonHelpers.h"
+-
+-#include "EdGraphSchema_K2.h"
+-#include "Engine/Blueprint.h"
+-#include "Kismet2/BlueprintEditorUtils.h"
+-
+-namespace {
+-	/* The referenced object of a property field, ex: the Struct of a StructProperty.
+-	 * Looked up by name because the path a cooked export carries rarely exists in the project. */
+-	template <typename T>
+-	T* ResolveField(const TSharedPtr<FJsonObject>& Property, const TCHAR* FieldName) {
+-		const TSharedPtr<FJsonObject>* Reference;
+-		if (!Property->TryGetObjectField(FieldName, Reference)) {
+-			return nullptr;
+-		}
+-
+-		FString ObjectName;
+-		if (!(*Reference)->TryGetStringField(TEXT("ObjectName"), ObjectName)) {
+-			return nullptr;
+-		}
+-
+-		const FName Name = GetExportNameOfSubobject(ObjectName);
+-		if (Name.IsNone()) {
+-			return nullptr;
+-		}
+-
+-		/* The path first, so a user defined struct or enum sitting in the project wins */
+-		FString ObjectPath;
+-		if ((*Reference)->TryGetStringField(TEXT("ObjectPath"), ObjectPath) && !ObjectPath.Contains(TEXT("/Script/"))) {
+-			int32 Dot;
+-			if (ObjectPath.FindLastChar(TEXT('.'), Dot)) {
+-				ObjectPath.LeftInline(Dot);
+-			}
+-
+-			if (T* Loaded = LoadObjectByPath<T>(ObjectPath + TEXT(".") + Name.ToString())) {
+-				return Loaded;
+-			}
+-		}
+-
+-#if UE5_1_BEYOND
+-		return FindFirstObject<T>(*Name.ToString());
+-#else
+-		return FindObject<T>(ANY_PACKAGE, *Name.ToString());
+-#endif
+-	}
+-
+-	/* Numeric and text types, everything that needs no object to point at */
+-	bool GetSimplePinCategory(const FString& Type, FName& OutCategory, FName& OutSubCategory) {
+-		OutSubCategory = NAME_None;
+-
+-		if (Type == TEXT("BoolProperty")) { OutCategory = UEdGraphSchema_K2::PC_Boolean; return true; }
+-		if (Type == TEXT("NameProperty")) { OutCategory = UEdGraphSchema_K2::PC_Name; return true; }
+-		if (Type == TEXT("StrProperty")) { OutCategory = UEdGraphSchema_K2::PC_String; return true; }
+-		if (Type == TEXT("TextProperty")) { OutCategory = UEdGraphSchema_K2::PC_Text; return true; }
+-		if (Type == TEXT("Int64Property")) { OutCategory = UEdGraphSchema_K2::PC_Int64; return true; }
+-
+-		/* Blueprints only offer one signed integer and one byte below 64 bits */
+-		if (Type == TEXT("IntProperty") || Type == TEXT("Int16Property") || Type == TEXT("Int8Property")
+-		 || Type == TEXT("UInt16Property") || Type == TEXT("UInt32Property")) {
+-			OutCategory = UEdGraphSchema_K2::PC_Int;
+-
+-			return true;
+-		}
+-
+-		if (Type == TEXT("FloatProperty") || Type == TEXT("DoubleProperty")) {
+-	/* 5.0 split the old float pin into a real pin carrying its width as a sub category */
+-#if ENGINE_UE5
+-			OutCategory = UEdGraphSchema_K2::PC_Real;
+-			OutSubCategory = Type == TEXT("DoubleProperty") ? UEdGraphSchema_K2::PC_Double : UEdGraphSchema_K2::PC_Float;
+-#else
+-			OutCategory = UEdGraphSchema_K2::PC_Float;
+-#endif
+-
+-			return true;
+-		}
+-
+-		return false;
+-	}
+-}
+-
+-bool FBlueprintVariables::IsUserVariable(const TSharedPtr<FJsonObject>& Property) {
+-	if (!Property.IsValid()) {
+-		return false;
+-	}
+-
+-	FString Flags;
+-	Property->TryGetStringField(TEXT("PropertyFlags"), Flags);
+-
+-	/* Anim graph node state, the ubergraph frame and the extension subsystems all carry no flags
+-	 * at all. What a user put on the blueprint is editable, visible to blueprints, or both. */
+-	return Flags.Contains(TEXT("Edit")) || Flags.Contains(TEXT("BlueprintVisible"));
+-}
+-
+-bool FBlueprintVariables::GetPinType(const TSharedPtr<FJsonObject>& Property, FEdGraphPinType& OutPinType) {
+-	if (!Property.IsValid()) {
+-		return false;
+-	}
+-
+-	FString Type;
+-	if (!Property->TryGetStringField(TEXT("Type"), Type)) {
+-		return false;
+-	}
+-
+-	/* Containers describe themselves through the property they hold, so the element decides the
+-	 * type and the container only decides the shape */
+-	const TSharedPtr<FJsonObject>* Element = nullptr;
+-
+-	if (Type == TEXT("ArrayProperty") && Property->TryGetObjectField(TEXT("Inner"), Element)) {
+-		if (!GetPinType(*Element, OutPinType)) return false;
+-
+-		OutPinType.ContainerType = EPinContainerType::Array;
+-
+-		return true;
+-	}
+-
+-	if (Type == TEXT("SetProperty") && Property->TryGetObjectField(TEXT("ElementProp"), Element)) {
+-		if (!GetPinType(*Element, OutPinType)) return false;
+-
+-		OutPinType.ContainerType = EPinContainerType::Set;
+-
+-		return true;
+-	}
+-
+-	if (Type == TEXT("MapProperty")) {
+-		const TSharedPtr<FJsonObject>* ValueProperty;
+-
+-		if (!Property->TryGetObjectField(TEXT("KeyProp"), Element)) return false;
+-		if (!Property->TryGetObjectField(TEXT("ValueProp"), ValueProperty)) return false;
+-
+-		FEdGraphPinType ValuePinType;
+-
+-		if (!GetPinType(*Element, OutPinType)) return false;
+-		if (!GetPinType(*ValueProperty, ValuePinType)) return false;
+-
+-		OutPinType.ContainerType = EPinContainerType::Map;
+-		OutPinType.PinValueType = FEdGraphTerminalType::FromPinType(ValuePinType);
+-
+-		return true;
+-	}
+-
+-	if (GetSimplePinCategory(Type, OutPinType.PinCategory, OutPinType.PinSubCategory)) {
+-		return true;
+-	}
+-
+-	if (Type == TEXT("StructProperty")) {
+-		UScriptStruct* Struct = ResolveField<UScriptStruct>(Property, TEXT("Struct"));
+-		if (!Struct) return false;
+-
+-		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+-		OutPinType.PinSubCategoryObject = Struct;
+-
+-		return true;
+-	}
+-
+-	if (Type == TEXT("EnumProperty") || Type == TEXT("ByteProperty")) {
+-		/* A byte with no enum behind it is just a byte */
+-		UEnum* Enum = ResolveField<UEnum>(Property, TEXT("Enum"));
+-
+-		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Byte;
+-		OutPinType.PinSubCategoryObject = Enum;
+-
+-		return Enum != nullptr || Type == TEXT("ByteProperty");
+-	}
+-
+-	if (Type == TEXT("ObjectProperty") || Type == TEXT("SoftObjectProperty")) {
+-		UClass* Class = ResolveField<UClass>(Property, TEXT("PropertyClass"));
+-		if (!Class) return false;
+-
+-		OutPinType.PinCategory = Type == TEXT("ObjectProperty") ? UEdGraphSchema_K2::PC_Object : UEdGraphSchema_K2::PC_SoftObject;
+-		OutPinType.PinSubCategoryObject = Class;
+-
+-		return true;
+-	}
+-
+-	if (Type == TEXT("ClassProperty") || Type == TEXT("SoftClassProperty")) {
+-		UClass* Class = ResolveField<UClass>(Property, TEXT("MetaClass"));
+-		if (!Class) return false;
+-
+-		OutPinType.PinCategory = Type == TEXT("ClassProperty") ? UEdGraphSchema_K2::PC_Class : UEdGraphSchema_K2::PC_SoftClass;
+-		OutPinType.PinSubCategoryObject = Class;
+-
+-		return true;
+-	}
+-
+-	if (Type == TEXT("InterfaceProperty")) {
+-		UClass* Class = ResolveField<UClass>(Property, TEXT("InterfaceClass"));
+-		if (!Class) return false;
+-
+-		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Interface;
+-		OutPinType.PinSubCategoryObject = Class;
+-
+-		return true;
+-	}
+-
+-	return false;
+-}
+-
+-int32 FBlueprintVariables::Construct(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>& ChildProperties) {
+-	if (Blueprint == nullptr) {
+-		return 0;
+-	}
+-
+-	int32 Added = 0;
+-	int32 Unsupported = 0;
+-
+-	for (const TSharedPtr<FJsonValue>& ChildProperty : ChildProperties) {
+-		const TSharedPtr<FJsonObject> Property = ChildProperty->AsObject();
+-
+-		if (!IsUserVariable(Property)) {
+-			continue;
+-		}
+-
+-		FString Name;
+-		if (!Property->TryGetStringField(TEXT("Name"), Name) || Name.IsEmpty()) {
+-			continue;
+-		}
+-
+-		const FName VariableName(*Name);
+-
+-		/* Inherited from the parent, or already added on a previous run */
+-		if (FindFProperty<FProperty>(Blueprint->GeneratedClass, VariableName) != nullptr) {
+-			continue;
+-		}
+-
+-		if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VariableName) != INDEX_NONE) {
+-			continue;
+-		}
+-
+-		FEdGraphPinType PinType;
+-		if (!GetPinType(Property, PinType)) {
+-			FString Type;
+-			Property->TryGetStringField(TEXT("Type"), Type);
+-
+-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" has no blueprint pin type for variable \"%s\" of type %s"), *Blueprint->GetName(), *Name, *Type);
+-
+-			Unsupported++;
+-
+-			continue;
+-		}
+-
+-		if (FBlueprintEditorUtils::AddMemberVariable(Blueprint, VariableName, PinType)) {
+-			Added++;
+-		} else {
+-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" would not take variable \"%s\""), *Blueprint->GetName(), *Name);
+-		}
+-	}
+-
+-	if (Unsupported > 0) {
+-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" added %d variables, %d had no usable type"), *Blueprint->GetName(), Added, Unsupported);
+-	}
+-
+-	return Added;
+-}
+=== FILE: Source/Reflection/Private/Importers/Types/Blueprint/Utilities/AnimationBlueprintUtilities.h ===
+diff --git a/Source/Reflection/Private/Importers/Types/Blueprint/Utilities/AnimationBlueprintUtilities.h b/Source/Reflection/Private/Importers/Types/Blueprint/Utilities/AnimationBlueprintUtilities.h
+index 6288e95..9431454 100644
+--- a/Source/Reflection/Private/Importers/Types/Blueprint/Utilities/AnimationBlueprintUtilities.h
++++ b/Source/Reflection/Private/Importers/Types/Blueprint/Utilities/AnimationBlueprintUtilities.h
+@@ -4,11 +4,8 @@
+ 
+ #include "AnimGraphNode_Base.h"
+ #include "AnimGraphNode_BlendListByEnum.h"
+-#include "Animation/AnimBlueprint.h"
+ #include "Dom/JsonObject.h"
+ #include "Dom/JsonValue.h"
+-#include "Engine/Compatibility.h"
+-#include "Engine/Log.h"
+ #include "Serializers/ObjectSerializer.h"
+ #include "Utilities/JsonHelpers.h"
+ 
+@@ -156,74 +153,6 @@ inline void HarvestAndTagConnectedStateMachineNodes(const FString& StartKey, con
+ 	}
+ }
+ 
+-/* Property bindings on animation graph nodes, and the struct describing them, arrived in 4.26 */
+-#if !UE4_25_BELOW
+-/* Stores a pin binding on a node.
+- *
+- * 5.3 moved the map off the node into an instanced binding object, leaving PropertyBindings behind
+- * as PropertyBindings_DEPRECATED. The replacement lives in UAnimGraphNodeBinding_Base, which sits
+- * in the module's Private folder with no public way to add an entry, so the map is reached through
+- * reflection instead. The struct stored in it is the same FAnimGraphNodePropertyBinding either way. */
+-inline bool AddPropertyBinding(UAnimGraphNode_Base* Node, const FName PinName, const FAnimGraphNodePropertyBinding& PropertyBinding) {
+-#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 3)
+-	/* Taken by reflection so the private binding type never has to be named */
+-	const FObjectProperty* BindingProperty = CastField<FObjectProperty>(Node->GetClass()->FindPropertyByName(TEXT("Binding")));
+-	if (!BindingProperty) return false;
+-
+-	UObject* BindingObject = BindingProperty->GetObjectPropertyValue_InContainer(Node);
+-
+-	/*
+-	 * A node built straight from NewObject never ran PostPlacedNewNode, which is where the editor
+-	 * hands it one of these. UAnimGraphNode_Base::EnsureBindingsArePresent does the job but is
+-	 * protected, so the same thing happens here: the blueprint's binding class if it names one,
+-	 * the engine's own otherwise.
+-	 */
+-	if (!BindingObject) {
+-		UClass* BindingClass = nullptr;
+-
+-		if (const UAnimBlueprint* OuterBlueprint = Node->GetTypedOuter<UAnimBlueprint>()) {
+-			BindingClass = OuterBlueprint->GetDefaultBindingClass();
+-		}
+-
+-		if (!BindingClass) {
+-			BindingClass = FindClassByType(TEXT("AnimGraphNodeBinding_Base"));
+-		}
+-
+-		if (!BindingClass) return false;
+-
+-		BindingObject = NewObject<UObject>(Node, BindingClass, NAME_None, RF_Transactional);
+-		if (!BindingObject) return false;
+-
+-		Node->Modify();
+-		BindingProperty->SetObjectPropertyValue_InContainer(Node, BindingObject);
+-	}
+-
+-	const FMapProperty* MapProperty = CastField<FMapProperty>(BindingObject->GetClass()->FindPropertyByName(TEXT("PropertyBindings")));
+-	if (!MapProperty) return false;
+-
+-	const FStructProperty* ValueProperty = CastField<FStructProperty>(MapProperty->ValueProp);
+-	if (!ValueProperty || ValueProperty->Struct != FAnimGraphNodePropertyBinding::StaticStruct()) return false;
+-
+-	BindingObject->Modify();
+-
+-	FScriptMapHelper MapHelper(MapProperty, MapProperty->ContainerPtrToValuePtr<void>(BindingObject));
+-
+-	const int32 Index = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
+-
+-	*static_cast<FName*>(static_cast<void*>(MapHelper.GetKeyPtr(Index))) = PinName;
+-	ValueProperty->Struct->CopyScriptStruct(MapHelper.GetValuePtr(Index), &PropertyBinding);
+-
+-	MapHelper.Rehash();
+-
+-	return true;
+-#else
+-	Node->PropertyBindings.Add(PinName, PropertyBinding);
+-
+-	return true;
+-#endif
+-}
+-#endif
+-
+ inline void HandlePropertyBinding(FUObjectExport* NodeExport, const TArray<TSharedPtr<FJsonValue>>& JsonObjects, UAnimGraphNode_Base* Node, IImporter* Importer, UAnimBlueprint* AnimBlueprint) {
+ 	const TSharedPtr<FJsonObject> NodeProperties = NodeExport->JsonObject;
+ 	
+@@ -249,11 +178,13 @@ inline void HandlePropertyBinding(FUObjectExport* NodeExport, const TArray<TShar
+ 
+ 					FString SourcePropertyName = CopyRecordAsObject->GetStringField(TEXT("SourcePropertyName"));
+ 					
+-					/* Take the property's name from the object name:
++					/*
++					 * Take the property's name from the object name:
+ 					 *
+ 					 * FloatProperty'AnimNode_SkeletalControlBase:Alpha' ->
+ 					 * :Alpha' ->
+-					 * Alpha */
++					 * Alpha
++					 */
+ 					const TSharedPtr<FJsonObject> DestProperty = CopyRecordAsObject->GetObjectField(TEXT("DestProperty"));
+ 					FString PinName = DestProperty->GetStringField(TEXT("ObjectName")); {
+ 						PinName.Split(TEXT(":"), nullptr, &PinName);
+@@ -284,14 +215,6 @@ inline void HandlePropertyBinding(FUObjectExport* NodeExport, const TArray<TShar
+ 					PropertyBinding.bIsBound = true;
+ 					PropertyBinding.PropertyPath.Append({ SourcePropertyName });
+ 
+-					/* The category above is the property's type lowercased, which was the pin
+-					 * category's spelling in 4.x. 5.0 folded float and double into "real" with the
+-					 * width in the sub category, so "float" now names no pin at all and the binding
+-					 * describes a pin that doesn't exist. The pin itself settles it when it's there. */
+-					if (const UEdGraphPin* DestinationPin = Node->FindPin(PinNameAsName, EGPD_Input)) {
+-						PropertyBinding.PinType = DestinationPin->PinType;
+-					}
+-
+ 					TSharedPtr<FJsonObject> SourcePropertyObject = GetExportMatchingWith(SourcePropertyName, "Name", JsonObjects);
+ 					if (PinCategory == "struct" && SourcePropertyObject.IsValid() && SourcePropertyObject->HasField(TEXT("Struct"))) {
+ 						TSharedPtr<FJsonObject> StructObject = SourcePropertyObject->GetObjectField(TEXT("Struct"));
+@@ -330,9 +253,9 @@ inline void HandlePropertyBinding(FUObjectExport* NodeExport, const TArray<TShar
+ 						}
+ 					}
+ 
+-					if (!AddPropertyBinding(Node, PinNameAsName, PropertyBinding)) {
+-						UE_LOG(LogReflection, Warning, TEXT("Binding dropped: %s.%s <- %s"), *Node->GetClass()->GetName(), *PinName, *SourcePropertyName);
+-					}
++#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION < 3) || ENGINE_UE4
++					Node->PropertyBindings.Add(PinNameAsName, PropertyBinding);
++#endif
+ #endif
+ 
+ 					if (PinName == "ActiveEnumValue" && Node != nullptr) {
+=== FILE: Source/Reflection/Private/Importers/Types/Texture/TextureCreator.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Texture/TextureCreator.cpp b/Source/Reflection/Private/Importers/Types/Texture/TextureCreator.cpp
+index eee9eba..5b05f00 100644
+--- a/Source/Reflection/Private/Importers/Types/Texture/TextureCreator.cpp
++++ b/Source/Reflection/Private/Importers/Types/Texture/TextureCreator.cpp
+@@ -2,74 +2,27 @@
+ 
+ #include "Importers/Types/Texture/TextureCreator.h"
+ 
+-#include "Engine/Texture2DArray.h"
+-#include "Engine/TextureCube.h"
+-#include "Engine/TextureLightProfile.h"
++#include "detex.h"
+ #include "Engine/TextureRenderTarget2D.h"
++#include "Engine/TextureCube.h"
+ #include "Engine/VolumeTexture.h"
+ #include "Factories/TextureFactory.h"
+ #include "Factories/TextureRenderTargetFactoryNew.h"
++#include "nvimage/DirectDrawSurface.h"
++#include "nvimage/Image.h"
+ #include "Settings/Runtime.h"
++#include "ThirdParty/NVTT/ThirdParty/NVTTStream.h"
+ #include "Engine/EngineUtilities.h"
+ #include "Utilities/JsonHelpers.h"
+ 
+-bool FTextureCreator::Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture) {
+-	if (Type == TEXT("Texture2D")) {
+-		return CreateTexture2D<UTexture2D>(OutTexture, Data, Export);
+-	}
+-
+-	if (Type == TEXT("TextureLightProfile")) {
+-		return CreateTexture2D<UTextureLightProfile>(OutTexture, Data, Export);
+-	}
+-
+-	if (Type == TEXT("Texture2DArray")) {
+-		return CreateTexture2DArray(OutTexture, Data, Export);
+-	}
+-
+-	if (Type == TEXT("TextureCube")) {
+-		return CreateTextureCube(OutTexture, Data, Export);
+-	}
+-
+-	if (Type == TEXT("VolumeTexture")) {
+-		return CreateVolumeTexture(OutTexture, Data, Export);
+-	}
+-
+-	if (Type == TEXT("TextureRenderTarget2D")) {
+-		return CreateRenderTarget2D(OutTexture, Export);
+-	}
+-
+-	UE_LOG(LogReflection, Error, TEXT("\"%s\" is a %s, which has no texture creator"), *AssetName, *Type);
+-
+-	return false;
+-}
+-
+-bool FTextureCreator::IsRawMipData() const {
+-#if PLATFORM_LINUX
+-	return false;
+-#else
+-	return UseRawMipData;
+-#endif
+-}
+-
+-bool FTextureCreator::RequireRawMipData(const TCHAR* What) const {
+-	if (IsRawMipData()) {
+-		return true;
+-	}
+-
+-	/* An encoded image is one flat eight bit picture. There is no stack of slices left in it to
+-	 * rebuild from, so these classes have nothing to work with. */
+-	UE_LOG(LogReflection, Error, TEXT("%s can only be rebuilt from raw mip data, which \"%s\" didn't come down as"), What, *AssetName);
+-
+-	return false;
+-}
+-
+-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Creators ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
++template bool FTextureCreatorUtilities::CreateTexture<UTexture2D>(UTexture*&, TArray<uint8>&, const TSharedPtr<FJsonObject>&);
++template bool FTextureCreatorUtilities::CreateTexture<UTextureLightProfile>(UTexture*&, TArray<uint8>&, const TSharedPtr<FJsonObject>&);
+ 
+ template <typename T>
+-bool FTextureCreator::CreateTexture2D(UTexture*& OutTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export) {
++bool FTextureCreatorUtilities::CreateTexture(UTexture*& OutTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties) {
+ 	UTexture2D* Texture2D;
+ 
+-	if (IsRawMipData()) {
++	if (IsOctetStreamEnabled()) {
+ 		Texture2D = NewObject<T>(Package, T::StaticClass(), *AssetName, RF_Standalone | RF_Public);
+ 	} else {
+ 		UTextureFactory* TextureFactory = NewObject<UTextureFactory>();
+@@ -81,13 +34,11 @@ bool FTextureCreator::CreateTexture2D(UTexture*& OutTexture, TArray<uint8>& Data
+ 			*FPaths::GetExtension(AssetName + ".png").ToLower(), ImageData, ImageData + Data.Num(), GWarn));
+ 	}
+ 
+-	if (Texture2D == nullptr) {
+-		return false;
+-	}
++	if (Texture2D == nullptr) return false;
+ 
+-	DeserializeTexture2D(Texture2D, Export);
++	DeserializeTexture2D(Texture2D, Properties->GetObjectField(TEXT("Properties")));
+ 
+-	if (!IsRawMipData()
++	if (!IsOctetStreamEnabled()
+ 		&& GReflectionRuntime.IsOlderUE4Target()
+ 		&&
+ 		(
+@@ -108,7 +59,7 @@ bool FTextureCreator::CreateTexture2D(UTexture*& OutTexture, TArray<uint8>& Data
+ 			const uint8 R = p[2], G = p[1], A = p[3];
+ 			p[0] = R; p[1] = G; p[2] = A; p[3] = 255;
+ 		}
+-
++		
+ 		Texture2D->Source.UnlockMip(0);
+ 	}
+ 
+@@ -116,147 +67,121 @@ bool FTextureCreator::CreateTexture2D(UTexture*& OutTexture, TArray<uint8>& Data
+ 		SetPlatformData(Texture2D, new FTexturePlatformData());
+ 	}
+ 
+-	if (HasSingleMip(Export)) {
+-		Texture2D->MipGenSettings = TMGS_NoMipmaps;
+-	}
+-
+-	/* An encoded image comes out of the factory with its source already filled in, only raw mips
+-	 * have to be turned back into source data by hand */
+-	if (IsRawMipData()) {
+-		FTextureCookedLayout Cooked;
+-		if (!GetCookedLayout(Export, 1, Cooked)) {
+-			return false;
+-		}
+-
+-		if (FTexturePlatformData* PlatformData = GetPlatformData(Texture2D)) {
+-			PlatformData->PixelFormat = Cooked.PixelFormat;
+-		}
++	FTexturePlatformData* PlatformData = GetPlatformData(Texture2D);
+ 
+-		if (!BuildSourceFromRawMip(Texture2D, Data, Cooked)) {
+-			return false;
++	if (const TArray<TSharedPtr<FJsonValue>>* TextureMipsPtr; Properties->TryGetArrayField(TEXT("Mips"), TextureMipsPtr)) {
++		const auto TextureMips = *TextureMipsPtr;
++	
++		if (TextureMips.Num() == 1) {
++			Texture2D->MipGenSettings = TMGS_NoMipmaps;
+ 		}
+ 	}
++	
++	if (IsOctetStreamEnabled()) {
++		DeserializeTexturePlatformData(Texture2D, Data, *PlatformData, Properties);
++	}
+ 
+ 	OutTexture = Texture2D;
+ 
+-	return true;
++	return false;
+ }
+ 
+-bool FTextureCreator::CreateTexture2DArray(UTexture*& OutTexture2DArray, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export) {
+-	if (!RequireRawMipData(TEXT("An array"))) {
+-		return false;
+-	}
++bool FTextureCreatorUtilities::IsOctetStreamEnabled() const {
++#if PLATFORM_LINUX
++	return false;
++#else
++	return UseOctetStream;
++#endif
++}
+ 
+-	UTexture2DArray* Texture2DArray = NewObject<UTexture2DArray>(Package, UTexture2DArray::StaticClass(), *AssetName, RF_Public | RF_Standalone);
++bool FTextureCreatorUtilities::CreateTextureCube(UTexture*& OutTextureCube, const TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties) const {
++	UTextureCube* TextureCube = NewObject<UTextureCube>(Package, UTextureCube::StaticClass(), *AssetName, RF_Public | RF_Standalone);
+ 
+-	DeserializeTexture(Texture2DArray, Export);
+-	SetPlatformData(Texture2DArray, new FTexturePlatformData());
++	SetPlatformData(TextureCube, new FTexturePlatformData());
++	
++	DeserializeTexture(TextureCube, Properties);
+ 
+-	/* Slices sit one after another rather than stacked into the height */
+-	FTextureCookedLayout Cooked;
+-	if (!GetCookedArrayLayout(Export, Cooked)) {
+-		return false;
+-	}
++	FTexturePlatformData* PlatformData = GetPlatformData(TextureCube);
+ 
+-	if (FTexturePlatformData* PlatformData = GetPlatformData(Texture2DArray)) {
+-		PlatformData->PixelFormat = Cooked.PixelFormat;
+-	}
++	const int SizeX = Properties->GetNumberField(TEXT("SizeX"));
++	const int SizeY = Properties->GetNumberField(TEXT("SizeY")) / 6;
+ 
+-	if (HasSingleMip(Export)) {
+-		Texture2DArray->MipGenSettings = TMGS_NoMipmaps;
++	FString PixelFormat;
++	if (Properties->TryGetStringField(TEXT("PixelFormat"), PixelFormat)) {
++		PlatformData->PixelFormat = static_cast<EPixelFormat>(TextureCube->GetPixelFormatEnum()->GetValueByNameString(PixelFormat));
+ 	}
+ 
+-	if (!BuildSourceFromRawMip(Texture2DArray, Data, Cooked)) {
+-		return false;
+-	}
++	int Size = SizeX * SizeY * (PlatformData->PixelFormat == PF_BC6H ? 16 : 4);
++	if (PlatformData->PixelFormat == PF_FloatRGBA) Size = Data.Num();
++	uint8* DecompressedData = static_cast<uint8*>(FMemory::Malloc(Size));
+ 
+-	OutTexture2DArray = Texture2DArray;
++	ETextureSourceFormat Format = TSF_BGRA8;
++	if (TextureCube->CompressionSettings == TC_HDR) Format = TSF_RGBA16F;
++	TextureCube->Source.Init(SizeX, SizeY, 1, 1, Format);
++	uint8_t* Dest = TextureCube->Source.LockMip(0);
++	FMemory::Memcpy(Dest, DecompressedData, Size);
++	TextureCube->Source.UnlockMip(0);
+ 
+-	return true;
+-}
++	TextureCube->PostEditChange();
+ 
+-bool FTextureCreator::CreateTextureCube(UTexture*& OutTextureCube, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export) {
+-	if (!RequireRawMipData(TEXT("A cube"))) {
+-		return false;
++	if (TextureCube) {
++		OutTextureCube = TextureCube;
++		return true;
+ 	}
+ 
+-	UTextureCube* TextureCube = NewObject<UTextureCube>(Package, UTextureCube::StaticClass(), *AssetName, RF_Public | RF_Standalone);
+-
+-	DeserializeTexture(TextureCube, Export);
+-	SetPlatformData(TextureCube, new FTexturePlatformData());
+-
+-	/* Always the same six faces, stacked */
+-	FTextureCookedLayout Cooked;
+-	if (!GetCookedLayout(Export, 6, Cooked)) {
+-		return false;
+-	}
++	return false;
++}
+ 
+-	if (FTexturePlatformData* PlatformData = GetPlatformData(TextureCube)) {
+-		PlatformData->PixelFormat = Cooked.PixelFormat;
+-	}
++bool FTextureCreatorUtilities::CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties) const {
++	UVolumeTexture* VolumeTexture = NewObject<UVolumeTexture>(Package, UVolumeTexture::StaticClass(), *AssetName, RF_Public | RF_Standalone);
+ 
+-	if (HasSingleMip(Export)) {
+-		TextureCube->MipGenSettings = TMGS_NoMipmaps;
+-	}
++	DeserializeTexture(VolumeTexture, Properties);
+ 
+-	if (!BuildSourceFromRawMip(TextureCube, Data, Cooked)) {
+-		return false;
+-	}
++	SetPlatformData(VolumeTexture, new FTexturePlatformData());
++	FString PixelFormat;
+ 
+-	OutTextureCube = TextureCube;
++	FTexturePlatformData* PlatformData = GetPlatformData(VolumeTexture);
+ 
+-	return true;
+-}
++	if (PlatformData != nullptr) {
++		if (Properties->TryGetStringField(TEXT("PixelFormat"), PixelFormat)) {
++			PlatformData->PixelFormat = static_cast<EPixelFormat>(VolumeTexture->GetPixelFormatEnum()->GetValueByNameString(PixelFormat));
++		}
+ 
+-bool FTextureCreator::CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export) {
+-	if (!RequireRawMipData(TEXT("A volume"))) {
+-		return false;
+ 	}
+ 
+-	UVolumeTexture* VolumeTexture = NewObject<UVolumeTexture>(Package, UVolumeTexture::StaticClass(), *AssetName, RF_Public | RF_Standalone);
++	DeserializeTexture(VolumeTexture, Properties);
+ 
+-	DeserializeTexture(VolumeTexture, Export);
+-	SetPlatformData(VolumeTexture, new FTexturePlatformData());
++	/* const int SizeX = Properties->GetNumberField(TEXT("SizeX"));
++	const int SizeY = Properties->GetNumberField(TEXT("SizeY"));
++	const int SizeZ = Properties->GetNumberField(TEXT("SizeZ")); Need to add the property */
++	/*constexpr int SizeZ = 1;
++	int Size = SizeX * SizeY * SizeZ;*/
+ 
+-	/* Depth varies per asset, so fall back to reading it off the width */
+-	FTextureCookedLayout Cooked;
+-	if (!GetCookedLayout(Export, 0, Cooked)) {
+-		return false;
+-	}
++	/* Decompression */
++	/*uint8* DecompressedData = static_cast<uint8*>(FMemory::Malloc(Size));
++	GetDecompressedTextureData(Data.GetData(), DecompressedData, SizeX, SizeY, SizeZ, Size, PlatformData->PixelFormat);
+ 
+-	Cooked.SlicesHalvePerMip = true;
++	VolumeTexture->Source.Init(SizeX, SizeY, SizeZ, 1, TSF_BGRA8);
+ 
+-	if (FTexturePlatformData* PlatformData = GetPlatformData(VolumeTexture)) {
+-		PlatformData->PixelFormat = Cooked.PixelFormat;
+-	}
++	uint8_t* Dest = VolumeTexture->Source.LockMip(0);
++	FMemory::Memcpy(Dest, DecompressedData, Size);
++	VolumeTexture->Source.UnlockMip(0);
++	VolumeTexture->UpdateResource();*/
+ 
+-	if (HasSingleMip(Export)) {
+-		VolumeTexture->MipGenSettings = TMGS_NoMipmaps;
+-	}
+-
+-	if (!BuildSourceFromRawMip(VolumeTexture, Data, Cooked)) {
+-		return false;
++	if (VolumeTexture) {
++		OutVolumeTexture = VolumeTexture;
++		return true;
+ 	}
+ 
+-	OutVolumeTexture = VolumeTexture;
+-
+-	return true;
++	return false;
+ }
+ 
+-bool FTextureCreator::CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const TSharedPtr<FJsonObject>& Export) {
++bool FTextureCreatorUtilities::CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const TSharedPtr<FJsonObject>& Properties) const {
+ 	UTextureRenderTargetFactoryNew* TextureFactory = NewObject<UTextureRenderTargetFactoryNew>();
+ 	TextureFactory->AddToRoot();
+ 	UTextureRenderTarget2D* RenderTarget2D = Cast<UTextureRenderTarget2D>(TextureFactory->FactoryCreateNew(UTextureRenderTarget2D::StaticClass(), Package, *AssetName, RF_Standalone | RF_Public, nullptr, GWarn));
+ 
+-	if (RenderTarget2D == nullptr) {
+-		return false;
+-	}
+-
+-	DeserializeTexture(RenderTarget2D, Export);
+-
+-	/* A render target is created empty, so its size is a property of its own rather than
+-	 * something cooked, and it never carries a payload to read one off */
+-	const TSharedPtr<FJsonObject> Properties = GetProperties(Export);
++	DeserializeTexture(RenderTarget2D, Properties);
+ 
+ 	int SizeX;
+ 	if (Properties->TryGetNumberField(TEXT("SizeX"), SizeX)) RenderTarget2D->SizeX = SizeX;
+@@ -270,7 +195,7 @@ bool FTextureCreator::CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const T
+ 	FString RenderTargetFormat;
+ 	if (Properties->TryGetStringField(TEXT("RenderTargetFormat"), RenderTargetFormat)) RenderTarget2D->RenderTargetFormat = static_cast<ETextureRenderTargetFormat>(StaticEnum<ETextureRenderTargetFormat>()->GetValueByNameString(RenderTargetFormat));
+ 
+-	bool bAutoGenerateMips = false;
++	bool bAutoGenerateMips;
+ 	if (Properties->TryGetBoolField(TEXT("bAutoGenerateMips"), bAutoGenerateMips)) RenderTarget2D->bAutoGenerateMips = bAutoGenerateMips;
+ 	/* Render targets only gained a mip sampler filter alongside auto generated mips in 4.23 */
+ #if !UE4_22_BELOW
+@@ -282,205 +207,30 @@ bool FTextureCreator::CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const T
+ 	}
+ #endif
+ 
+-	OutRenderTarget2D = RenderTarget2D;
+-
+-	return true;
+-}
+-
+-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Source data ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+-
+-int64 FTextureCookedLayout::GetEncodedSize() const {
+-	return Source.GetEncodedSliceSize(SizeX, SizeY) * SizeZ;
+-}
+-
+-bool FTextureCookedLayout::DropMip() {
+-	/* Block compressed data bottoms out at a single block, and the decoders count whole blocks */
+-	const int32 Smallest = Source.BlockDim;
+-
+-	if (SizeX <= Smallest && SizeY <= Smallest) {
+-		return false;
+-	}
+-
+-	SizeX = FMath::Max(Smallest, SizeX / 2);
+-	SizeY = FMath::Max(Smallest, SizeY / 2);
+-
+-	if (SlicesHalvePerMip) {
+-		SizeZ = FMath::Max(1, SizeZ / 2);
+-	}
+-
+-	return true;
+-}
+-
+-bool FTextureCreator::GetCookedLayout(const TSharedPtr<FJsonObject>& Export, const int32 FallbackSlices, FTextureCookedLayout& OutCooked) const {
+-	int32 SizeX = 0;
+-	int32 StackedSizeY = 0;
+-
+-	Export->TryGetNumberField(TEXT("SizeX"), SizeX);
+-	Export->TryGetNumberField(TEXT("SizeY"), StackedSizeY);
+-
+-	int32 Slices = 0;
+-	if (!Export->TryGetNumberField(TEXT("SizeZ"), Slices) || Slices <= 0) {
+-		Slices = FallbackSlices > 0
+-			? FallbackSlices
+-			: (SizeX > 0 ? StackedSizeY / SizeX : 0);
+-
+-		if (FallbackSlices <= 0) {
+-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" was sent without a slice count, reading %d off its width. Update Core to import this reliably."), *AssetName, Slices);
+-		}
+-	}
+-
+-	const int32 SizeY = Slices > 0 ? StackedSizeY / Slices : 0;
+-
+-	if (Slices <= 0 || SizeY * Slices != StackedSizeY) {
+-		UE_LOG(LogReflection, Error, TEXT("\"%s\" was cooked at an unusable size (%d x %d over %d slices)"), *AssetName, SizeX, StackedSizeY, Slices);
+-
+-		return false;
+-	}
+-
+-	return ReadCookedLayout(Export, SizeX, SizeY, Slices, OutCooked);
+-}
+-
+-bool FTextureCreator::GetCookedArrayLayout(const TSharedPtr<FJsonObject>& Export, FTextureCookedLayout& OutCooked) const {
+-	int32 SizeX = 0;
+-	int32 SizeY = 0;
+-
+-	Export->TryGetNumberField(TEXT("SizeX"), SizeX);
+-	Export->TryGetNumberField(TEXT("SizeY"), SizeY);
+-
+-	/* Nothing was folded into the height here, so the count is whatever the export says it is */
+-	const int32 Slices = GetReportedSliceCount(Export);
+-
+-	return ReadCookedLayout(Export, SizeX, SizeY, Slices > 0 ? Slices : 1, OutCooked);
+-}
+-
+-bool FTextureCreator::ReadCookedLayout(const TSharedPtr<FJsonObject>& Export, const int32 SizeX, const int32 SizeY, const int32 Slices, FTextureCookedLayout& OutCooked) const {
+-	OutCooked.SizeX = SizeX;
+-	OutCooked.SizeY = SizeY;
+-	OutCooked.SizeZ = Slices;
+-
+-	FString PixelFormatName;
+-	Export->TryGetStringField(TEXT("PixelFormat"), PixelFormatName);
+-	OutCooked.PixelFormat = FTextureFormats::FromName(PixelFormatName);
+-
+-	if (SizeX <= 0 || SizeY <= 0 || Slices <= 0) {
+-		UE_LOG(LogReflection, Error, TEXT("\"%s\" was cooked at an unusable size (%d x %d over %d slices)"), *AssetName, SizeX, SizeY, Slices);
+-
+-		return false;
+-	}
+-
+-	if (!FTextureFormats::GetLayout(OutCooked.PixelFormat, OutCooked.Source)) {
+-		UE_LOG(LogReflection, Error, TEXT("\"%s\" was cooked as %s, which has no source format mapping yet"), *AssetName, *PixelFormatName);
+-
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-int32 FTextureCreator::GetReportedSliceCount(const TSharedPtr<FJsonObject>& Export) {
+-	/* 4.25 packed the slice count in with the cube map and opt data bits. Before that it stood on
+-	 * its own, and the dump names it accordingly, so both spellings are read. */
+-	uint32 PackedData = 0;
+-	if (Export->TryGetNumberField(TEXT("PackedData"), PackedData)) {
+-		constexpr uint32 SliceMask = (1u << 30) - 1u;
+-
+-		return static_cast<int32>(PackedData & SliceMask);
+-	}
+-
+-	int32 NumSlices = 0;
+-	Export->TryGetNumberField(TEXT("NumSlices"), NumSlices);
+-
+-	return NumSlices;
+-}
+-
+-bool FTextureCreator::BuildSourceFromRawMip(UTexture* Texture, const TArray<uint8>& Data, const FTextureCookedLayout& Cooked) const {
+-	/*
+-	 * Cloud sends the first mip that still has its bulk data, which isn't always the top one:
+-	 * higher mips can live in a pak that isn't mounted. The payload size says which mip actually
+-	 * came through, so walk the chain until it fits rather than decoding at the wrong size.
+-	 */
+-	FTextureCookedLayout Mip = Cooked;
+-
+-	/* The size has to land exactly. Settling for "big enough" would happily decode the wrong mip
+-	 * at the wrong dimensions and hand back a plausible looking asset full of noise. */
+-	while (Data.Num() != Mip.GetEncodedSize()) {
+-		if (!Mip.DropMip()) {
+-			UE_LOG(LogReflection, Error, TEXT("\"%s\" came back with %d bytes, which matches no mip of a %d x %d x %d %s texture"), *AssetName, Data.Num(), Cooked.SizeX, Cooked.SizeY, Cooked.SizeZ, *UTexture::GetPixelFormatEnum()->GetNameStringByValue(Cooked.PixelFormat));
+-
+-			return false;
+-		}
+-	}
+-
+-	if (Mip.SizeX != Cooked.SizeX) {
+-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" only had mip data down at %d x %d x %d, importing that instead of %d x %d x %d"), *AssetName, Mip.SizeX, Mip.SizeY, Mip.SizeZ, Cooked.SizeX, Cooked.SizeY, Cooked.SizeZ);
+-	}
+-
+-	const int64 EncodedSliceSize = Mip.Source.GetEncodedSliceSize(Mip.SizeX, Mip.SizeY);
+-	const int64 DecodedSliceSize = Mip.Source.GetDecodedSliceSize(Mip.SizeX, Mip.SizeY);
+-
+-	uint8* SourceData = static_cast<uint8*>(FMemory::Malloc(DecodedSliceSize * Mip.SizeZ));
+-
+-	for (int32 SliceIndex = 0; SliceIndex < Mip.SizeZ; SliceIndex++) {
+-		const uint8* EncodedSlice = Data.GetData() + EncodedSliceSize * SliceIndex;
+-		uint8* DecodedSlice = SourceData + DecodedSliceSize * SliceIndex;
+-
+-		if (Mip.Source.RequiresDecode) {
+-			FTextureFormats::Decode(EncodedSlice, DecodedSlice, Mip.SizeX, Mip.SizeY, DecodedSliceSize, Mip.PixelFormat);
+-		} else {
+-			FMemory::Memcpy(DecodedSlice, EncodedSlice, DecodedSliceSize);
+-		}
+-	}
+-
+-	Texture->Source.Init(Mip.SizeX, Mip.SizeY, Mip.SizeZ, 1, Mip.Source.SourceFormat, SourceData);
+-
+-	FMemory::Free(SourceData);
+-
+-	if (Texture->LODGroup == 255) {
+-		Texture->LODGroup = TEXTUREGROUP_World;
++	if (RenderTarget2D) {
++		OutRenderTarget2D = RenderTarget2D;
++		return true;
+ 	}
+ 
+-	Texture->UpdateResource();
+-
+-	return true;
+-}
+-
+-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Deserialization ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+-
+-void FTextureCreator::DeserializeTexture(UTexture* Texture, const TSharedPtr<FJsonObject>& Export) const {
+-	if (Texture == nullptr) return;
+-
+-	GetObjectSerializer()->DeserializeObjectProperties(RemovePropertiesShared(GetProperties(Export), {
+-		"ImportedSize",
+-		"LODBias"
+-	}), Texture);
++	return false;
+ }
+ 
+-void FTextureCreator::DeserializeTexture2D(UTexture2D* Texture2D, const TSharedPtr<FJsonObject>& Export) const {
+-	if (Texture2D == nullptr) return;
+-
+-	DeserializeTexture(Texture2D, Export);
++bool FTextureCreatorUtilities::DeserializeTexture2D(UTexture2D* InTexture2D, const TSharedPtr<FJsonObject>& Properties) const {
++	if (InTexture2D == nullptr) return false;
+ 
+-	const TSharedPtr<FJsonObject> Properties = GetProperties(Export);
++	DeserializeTexture(InTexture2D, Properties);
+ 
+ 	FString AddressX;
+ 	FString AddressY;
+ 	bool bHasBeenPaintedInEditor;
+ 
+-	if (Properties->TryGetStringField(TEXT("AddressX"), AddressX)) Texture2D->AddressX = static_cast<TextureAddress>(StaticEnum<TextureAddress>()->GetValueByNameString(AddressX));
+-	if (Properties->TryGetStringField(TEXT("AddressY"), AddressY)) Texture2D->AddressY = static_cast<TextureAddress>(StaticEnum<TextureAddress>()->GetValueByNameString(AddressY));
+-	if (Properties->TryGetBoolField(TEXT("bHasBeenPaintedInEditor"), bHasBeenPaintedInEditor)) Texture2D->bHasBeenPaintedInEditor = bHasBeenPaintedInEditor;
+-
+-	int FirstResourceMemMip;
+-	int LevelIndex;
+-
+-	if (Properties->TryGetNumberField(TEXT("FirstResourceMemMip"), FirstResourceMemMip)) Texture2D->FirstResourceMemMip = FirstResourceMemMip;
+-	if (Properties->TryGetNumberField(TEXT("LevelIndex"), LevelIndex)) Texture2D->LevelIndex = LevelIndex;
++	if (Properties->TryGetStringField(TEXT("AddressX"), AddressX)) InTexture2D->AddressX = static_cast<TextureAddress>(StaticEnum<TextureAddress>()->GetValueByNameString(AddressX));
++	if (Properties->TryGetStringField(TEXT("AddressY"), AddressY)) InTexture2D->AddressY = static_cast<TextureAddress>(StaticEnum<TextureAddress>()->GetValueByNameString(AddressY));
++	if (Properties->TryGetBoolField(TEXT("bHasBeenPaintedInEditor"), bHasBeenPaintedInEditor)) InTexture2D->bHasBeenPaintedInEditor = bHasBeenPaintedInEditor;
+ 
+ 	/* ~~~~~~~~~~~~~ Platform Data ~~~~~~~~~~~~~ */
+-	FTexturePlatformData* PlatformData = GetPlatformData(Texture2D);
+-	if (PlatformData == nullptr) return;
+-
+-	/* Cooked sizes live on the export rather than under its properties */
++	FTexturePlatformData* PlatformData = GetPlatformData(InTexture2D);
++	
+ 	int SizeX;
+ 	int SizeY;
+ #if !UE4_24_BELOW
+@@ -488,31 +238,187 @@ void FTextureCreator::DeserializeTexture2D(UTexture2D* Texture2D, const TSharedP
+ #endif
+ 	FString PixelFormat;
+ 
+-	if (Export->TryGetNumberField(TEXT("SizeX"), SizeX)) PlatformData->SizeX = SizeX;
+-	if (Export->TryGetNumberField(TEXT("SizeY"), SizeY)) PlatformData->SizeY = SizeY;
++	if (Properties->TryGetNumberField(TEXT("SizeX"), SizeX)) PlatformData->SizeX = SizeX;
++	if (Properties->TryGetNumberField(TEXT("SizeY"), SizeY)) PlatformData->SizeY = SizeY;
+ 	/* 4.25 packed the slice count together with the cube map and opt data bits into PackedData.
+ 	 * Before that the slice count stood on its own, and the dump names it accordingly. */
+ #if UE4_24_BELOW
+ 	int NumSlices;
+-	if (Export->TryGetNumberField(TEXT("NumSlices"), NumSlices)) PlatformData->NumSlices = NumSlices;
++	if (Properties->TryGetNumberField(TEXT("NumSlices"), NumSlices)) PlatformData->NumSlices = NumSlices;
+ #else
+-	if (Export->TryGetNumberField(TEXT("PackedData"), PackedData)) PlatformData->PackedData = PackedData;
++	if (Properties->TryGetNumberField(TEXT("PackedData"), PackedData)) PlatformData->PackedData = PackedData;
+ #endif
+-	if (Export->TryGetStringField(TEXT("PixelFormat"), PixelFormat)) PlatformData->PixelFormat = FTextureFormats::FromName(PixelFormat);
++	if (Properties->TryGetStringField(TEXT("PixelFormat"), PixelFormat)) PlatformData->PixelFormat = static_cast<EPixelFormat>(InTexture2D->GetPixelFormatEnum()->GetValueByNameString(PixelFormat));
++
++	int FirstResourceMemMip;
++	int LevelIndex;
++	
++	if (Properties->TryGetNumberField(TEXT("FirstResourceMemMip"), FirstResourceMemMip)) InTexture2D->FirstResourceMemMip = FirstResourceMemMip;
++	if (Properties->TryGetNumberField(TEXT("LevelIndex"), LevelIndex)) InTexture2D->LevelIndex = LevelIndex;
++
++	return false;
+ }
+ 
+-bool FTextureCreator::HasSingleMip(const TSharedPtr<FJsonObject>& Export) {
+-	const TArray<TSharedPtr<FJsonValue>>* Mips;
++bool FTextureCreatorUtilities::DeserializeTexture(UTexture* Texture, const TSharedPtr<FJsonObject>& Properties) const {
++	if (Texture == nullptr) return false;
+ 
+-	return Export->TryGetArrayField(TEXT("Mips"), Mips) && Mips->Num() == 1;
++	GetObjectSerializer()->DeserializeObjectProperties(RemovePropertiesShared(Properties, {
++		"ImportedSize",
++		"LODBias"
++	}), Texture);
++	
++	return false;
+ }
+ 
+-TSharedPtr<FJsonObject> FTextureCreator::GetProperties(const TSharedPtr<FJsonObject>& Export) {
+-	const TSharedPtr<FJsonObject>* Properties;
++bool FTextureCreatorUtilities::DeserializeTexturePlatformData(UTexture* Texture, TArray<uint8>& Data, FTexturePlatformData& TexturePlatformData,
++	const TSharedPtr<FJsonObject>& Properties)
++{
++	const int SizeX = Properties->GetNumberField(TEXT("SizeX"));
++	const int SizeY = Properties->GetNumberField(TEXT("SizeY"));
++	constexpr int SizeZ = 1;
+ 
+-	if (Export.IsValid() && Export->TryGetObjectField(TEXT("Properties"), Properties)) {
+-		return *Properties;
++	FString PixelFormat;
++	if (Properties->TryGetStringField(TEXT("PixelFormat"), PixelFormat)) {
++		TexturePlatformData.PixelFormat = static_cast<EPixelFormat>(Texture->GetPixelFormatEnum()->GetValueByNameString(PixelFormat));
+ 	}
+ 
+-	return MakeShared<FJsonObject>();
++	int Size = SizeX * SizeY * (TexturePlatformData.PixelFormat == PF_BC6H ? 16 : 4);
++	if (TexturePlatformData.PixelFormat == PF_B8G8R8A8 || TexturePlatformData.PixelFormat == PF_FloatRGBA || TexturePlatformData.PixelFormat == PF_G16) Size = Data.Num();
++	uint8* DecompressedData = static_cast<uint8*>(FMemory::Malloc(Size));
++
++	if (IsOctetStreamEnabled()) {
++		GetDecompressedTextureData(Data.GetData(), DecompressedData, SizeX, SizeY, SizeZ, Size, TexturePlatformData.PixelFormat);
++	} else {
++		DecompressedData = Data.GetData();
++	}
++
++	ETextureSourceFormat Format = TSF_BGRA8;
++	if (Texture->CompressionSettings == TC_HDR) Format = TSF_RGBA16F;
++	/* TSF_G16 arrived in 4.25; before that a 16 bit grey source has no matching source format,
++	 * so it stays on the BGRA8 path the rest of this function already handles */
++#if !UE4_24_BELOW
++	if (TexturePlatformData.PixelFormat == PF_G16) Format = TSF_G16;
++#endif
++	Texture->Source.Init(SizeX, SizeY, 1, 1, Format);
++	uint8_t* Dest = Texture->Source.LockMip(0);
++	FMemory::Memcpy(Dest, DecompressedData, Size);
++	Texture->Source.UnlockMip(0);
++
++	if (Texture->LODGroup == 255) {
++		Texture->LODGroup = TEXTUREGROUP_World;
++	}
++
++	Texture->UpdateResource();
++
++	if (Texture && Texture->IsValidLowLevel() && Texture != nullptr) {
++		return true;
++	}
++	
++	return false;
++}
++
++void FTextureCreatorUtilities::GetDecompressedTextureData(uint8* Data, uint8*& OutData, const int SizeX, const int SizeY, const int SizeZ, const int TotalSize, const EPixelFormat Format) {
++#if PLATFORM_WINDOWS
++	/* NOTE: Not all formats are supported, feel free to add if needed. Formats may need other dependencies. */
++	switch (Format) {
++		case PF_BC7: {
++			detexTexture Texture;
++			Texture.data = Data;
++			Texture.format = DETEX_TEXTURE_FORMAT_BPTC;
++			Texture.width = SizeX;
++			Texture.height = SizeY;
++			Texture.width_in_blocks = SizeX / 4;
++			Texture.height_in_blocks = SizeY / 4;
++
++			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
++		}
++		break;
++
++		case PF_BC6H: {
++			detexTexture Texture;
++			Texture.data = Data;
++			Texture.format = DETEX_TEXTURE_FORMAT_BPTC_FLOAT;
++			Texture.width = SizeX;
++			Texture.height = SizeY;
++			Texture.width_in_blocks = SizeX / 4;
++			Texture.height_in_blocks = SizeY / 4;
++
++			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
++		}
++		break;
++
++		case PF_DXT5: {
++			detexTexture Texture;
++			{
++				Texture.data = Data;
++				Texture.format = DETEX_TEXTURE_FORMAT_BC3;
++				Texture.width = SizeX;
++				Texture.height = SizeY;
++				Texture.width_in_blocks = SizeX / 4;
++				Texture.height_in_blocks = SizeY / 4;
++			}
++
++			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
++		}
++		break;
++
++		/* Gray/Grey, not Green, typically actually uses a red format with replication of R to RGB*/
++		case PF_G8: {
++			const uint8* s = Data;
++			uint8* d = OutData;
++
++			for (int i = 0; i < SizeX * SizeY; i++) {
++				const uint8 b = *s++;
++				*d++ = b;
++				*d++ = b;
++				*d++ = b;
++				*d++ = 255;
++			}
++		}
++		break;
++
++		/*
++		 * FloatRGBA: 16F
++		 * G16: Gray/Grey like G8
++		*/
++		case PF_B8G8R8A8:
++		case PF_FloatRGBA:
++		case PF_G16: {
++			FMemory::Memcpy(OutData, Data, TotalSize);
++		}
++		break;
++
++		default: {
++			nv::DDSHeader Header;
++			nv::Image Image;
++
++			uint FourCC;
++			switch (Format) {
++			case PF_BC4:
++				FourCC = FOURCC_ATI1;
++				break;
++			case PF_BC5:
++				FourCC = FOURCC_ATI2;
++				break;
++			case PF_DXT1:
++				FourCC = FOURCC_DXT1;
++				break;
++			case PF_DXT3:
++				FourCC = FOURCC_DXT3;
++				break;
++			default: FourCC = 0;
++			}
++
++			Header.setFourCC(FourCC);
++			Header.setWidth(SizeX);
++			Header.setHeight(SizeY);
++			Header.setDepth(SizeZ);
++			Header.setNormalFlag(Format == PF_BC5);
++			DecodeDDS(Data, SizeX, SizeY, SizeZ, Header, Image);
++
++			FMemory::Memcpy(OutData, Image.pixels(), TotalSize);
++		}
++		break;
++	}
++#endif
+ }
+=== FILE: Source/Reflection/Private/Importers/Types/Texture/TextureFormats.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Texture/TextureFormats.cpp b/Source/Reflection/Private/Importers/Types/Texture/TextureFormats.cpp
+deleted file mode 100644
+index 6d80299..0000000
+--- a/Source/Reflection/Private/Importers/Types/Texture/TextureFormats.cpp
++++ /dev/null
+@@ -1,191 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Importers/Types/Texture/TextureFormats.h"
+-
+-#include "detex.h"
+-#include "nvimage/DirectDrawSurface.h"
+-#include "nvimage/Image.h"
+-#include "ThirdParty/NVTT/ThirdParty/NVTTStream.h"
+-
+-int64 FTextureSourceLayout::GetEncodedSliceSize(const int32 SizeX, const int32 SizeY) const {
+-	const int64 BlocksX = (SizeX + BlockDim - 1) / BlockDim;
+-	const int64 BlocksY = (SizeY + BlockDim - 1) / BlockDim;
+-
+-	return BlocksX * BlocksY * BytesPerBlock;
+-}
+-
+-int64 FTextureSourceLayout::GetDecodedSliceSize(const int32 SizeX, const int32 SizeY) const {
+-	return static_cast<int64>(SizeX) * SizeY * BytesPerVoxel;
+-}
+-
+-EPixelFormat FTextureFormats::FromName(const FString& Name) {
+-	if (Name.IsEmpty()) {
+-		return PF_Unknown;
+-	}
+-
+-	const int64 Value = UTexture::GetPixelFormatEnum()->GetValueByNameString(Name);
+-	if (Value == INDEX_NONE) {
+-		return PF_Unknown;
+-	}
+-
+-	return static_cast<EPixelFormat>(Value);
+-}
+-
+-bool FTextureFormats::GetLayout(const EPixelFormat Format, FTextureSourceLayout& OutLayout) {
+-	OutLayout = FTextureSourceLayout();
+-
+-	switch (Format) {
+-		/* Uncompressed, straight copy into the source buffer */
+-		case PF_B8G8R8A8:
+-			return true;
+-
+-		case PF_FloatRGBA:
+-			OutLayout.SourceFormat = TSF_RGBA16F;
+-			OutLayout.BytesPerVoxel = 8;
+-			OutLayout.BytesPerBlock = 8;
+-			return true;
+-
+-	/* TSF_G16 arrived in 4.25, before that a 16 bit grey source has no matching source format */
+-#if !UE4_24_BELOW
+-		case PF_G16:
+-			OutLayout.SourceFormat = TSF_G16;
+-			OutLayout.BytesPerVoxel = 2;
+-			OutLayout.BytesPerBlock = 2;
+-			return true;
+-#endif
+-
+-		/* Grey, one byte in and replicated out to BGRA by the decode */
+-		case PF_G8:
+-			OutLayout.BytesPerBlock = 1;
+-			OutLayout.RequiresDecode = true;
+-			return true;
+-
+-		/* Block compressed, 8 bytes per 4x4 block */
+-		case PF_DXT1:
+-		case PF_BC4:
+-			OutLayout.BlockDim = 4;
+-			OutLayout.BytesPerBlock = 8;
+-			OutLayout.RequiresDecode = true;
+-			return true;
+-
+-		/* Block compressed, 16 bytes per 4x4 block.
+-		 * BC6H is HDR and decodes down to BGRA8 here, which clips it, but detex has no float
+-		 * output wired up yet and a clipped texture beats no texture. */
+-		case PF_DXT3:
+-		case PF_DXT5:
+-		case PF_BC5:
+-		case PF_BC6H:
+-		case PF_BC7:
+-			OutLayout.BlockDim = 4;
+-			OutLayout.BytesPerBlock = 16;
+-			OutLayout.RequiresDecode = true;
+-			return true;
+-
+-		default:
+-			return false;
+-	}
+-}
+-
+-void FTextureFormats::Decode(const uint8* Data, uint8* OutData, const int32 SizeX, const int32 SizeY, const int64 DecodedSize, const EPixelFormat Format) {
+-#if PLATFORM_WINDOWS
+-	switch (Format) {
+-		case PF_BC7: {
+-			detexTexture Texture;
+-			Texture.data = const_cast<uint8*>(Data);
+-			Texture.format = DETEX_TEXTURE_FORMAT_BPTC;
+-			Texture.width = SizeX;
+-			Texture.height = SizeY;
+-			Texture.width_in_blocks = SizeX / 4;
+-			Texture.height_in_blocks = SizeY / 4;
+-
+-			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
+-		}
+-		break;
+-
+-		case PF_BC6H: {
+-			detexTexture Texture;
+-			Texture.data = const_cast<uint8*>(Data);
+-			Texture.format = DETEX_TEXTURE_FORMAT_BPTC_FLOAT;
+-			Texture.width = SizeX;
+-			Texture.height = SizeY;
+-			Texture.width_in_blocks = SizeX / 4;
+-			Texture.height_in_blocks = SizeY / 4;
+-
+-			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
+-		}
+-		break;
+-
+-		case PF_DXT5: {
+-			detexTexture Texture;
+-			Texture.data = const_cast<uint8*>(Data);
+-			Texture.format = DETEX_TEXTURE_FORMAT_BC3;
+-			Texture.width = SizeX;
+-			Texture.height = SizeY;
+-			Texture.width_in_blocks = SizeX / 4;
+-			Texture.height_in_blocks = SizeY / 4;
+-
+-			detexDecompressTextureLinear(&Texture, OutData, DETEX_PIXEL_FORMAT_BGRA8);
+-		}
+-		break;
+-
+-		/* Gray/Grey, not Green, typically actually uses a red format with replication of R to RGB */
+-		case PF_G8: {
+-			const uint8* Source = Data;
+-			uint8* Destination = OutData;
+-
+-			for (int32 Index = 0; Index < SizeX * SizeY; Index++) {
+-				const uint8 Grey = *Source++;
+-
+-				*Destination++ = Grey;
+-				*Destination++ = Grey;
+-				*Destination++ = Grey;
+-				*Destination++ = 255;
+-			}
+-		}
+-		break;
+-
+-		/*
+-		 * FloatRGBA: 16F
+-		 * G16: Gray/Grey like G8
+-		*/
+-		case PF_B8G8R8A8:
+-		case PF_FloatRGBA:
+-		case PF_G16: {
+-			FMemory::Memcpy(OutData, Data, DecodedSize);
+-		}
+-		break;
+-
+-		default: {
+-			nv::DDSHeader Header;
+-			nv::Image Image;
+-
+-			uint FourCC;
+-			switch (Format) {
+-			case PF_BC4:
+-				FourCC = FOURCC_ATI1;
+-				break;
+-			case PF_BC5:
+-				FourCC = FOURCC_ATI2;
+-				break;
+-			case PF_DXT1:
+-				FourCC = FOURCC_DXT1;
+-				break;
+-			case PF_DXT3:
+-				FourCC = FOURCC_DXT3;
+-				break;
+-			default: FourCC = 0;
+-			}
+-
+-			Header.setFourCC(FourCC);
+-			Header.setWidth(SizeX);
+-			Header.setHeight(SizeY);
+-			Header.setDepth(1);
+-			Header.setNormalFlag(Format == PF_BC5);
+-			DecodeDDS(Data, SizeX, SizeY, 1, Header, Image);
+-
+-			FMemory::Memcpy(OutData, Image.pixels(), DecodedSize);
+-		}
+-		break;
+-	}
+-#endif
+-}
+=== FILE: Source/Reflection/Private/Importers/Types/Texture/TextureImporter.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Texture/TextureImporter.cpp b/Source/Reflection/Private/Importers/Types/Texture/TextureImporter.cpp
+index 3cb8f9d..84318cf 100644
+--- a/Source/Reflection/Private/Importers/Types/Texture/TextureImporter.cpp
++++ b/Source/Reflection/Private/Importers/Types/Texture/TextureImporter.cpp
+@@ -1,142 +1,16 @@
+ /* Copyright Reflection Contributors 2024-2026 */
+ 
+ #include "Importers/Types/Texture/TextureImporter.h"
+-
+-#include "Importers/Types/Texture/TextureCreator.h"
+-#include "Importers/Types/Texture/TextureTypes.h"
+-#include "Importers/Constructor/Asset.h"
+-
+ #include "Engine/TextureLightProfile.h"
+-#include "Engine/EngineUtilities.h"
+-#include "HttpModule.h"
+-#include "Interfaces/IHttpResponse.h"
+-#include "Modules/Cloud/Cloud.h"
+-#include "Modules/Cloud/Remote.h"
+-#include "Settings/ReflectionSettings.h"
+-
+-/* AssetRegistryModule.h only moved under an AssetRegistry/ folder later on */
+-#if UE4_25_BELOW
+-#include "AssetRegistryModule.h"
+-#else
+-#include "AssetRegistry/AssetRegistryModule.h"
+-#endif
+ 
+-/* Explicit instantiation of ITextureImporter for UObject */
++/* Explicit instantiation of ITemplatedImporter for UObject */
+ template class ITextureImporter<UTexture>;
+ template class ITextureImporter<UTextureLightProfile>;
+ 
+ template <typename AssetType>
+ bool ITextureImporter<AssetType>::Import() {
+-	TObjectPtr<AssetType> Texture;
+-	DownloadWrapper<AssetType>(Texture, GetAssetType(), GetAssetName(), GetPackage()->GetPathName());
+-
+-	return true;
+-}
+-
+-/*
+- * The pixels come from the export endpoint too, with the content type of the request picking the
+- * encoding: an image the texture factory can take, or the raw bytes of the first mip.
+- */
+-static bool DownloadPixels(const FString& FetchPath, const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& OutData) {
+-	const bool UseRawMipData = FTextureTypes::RequiresRawMipData(Type, FTextureTypes::IsVectorDisplacementMap(Export));
+-
+-	const FReflectionHttpRequest HttpRequest = FHttpModule::Get().CreateRequest();
+-
+-	HttpRequest->SetURL(Cloud::URL + Cloud::ExportURL + "?path=" + FetchPath);
+-	HttpRequest->SetHeader("content-type", UseRawMipData ? "application/octet-stream" : "image/png");
+-	HttpRequest->SetVerb(TEXT("GET"));
+-
+-	const FReflectionHttpResponse HttpResponse = FRemoteUtilities::ExecuteRequestBlocking(HttpRequest);
+-
+-	if (!HttpResponse.IsValid() || HttpResponse->GetResponseCode() != 200) {
+-		return false;
+-	}
+-
+-	/* Cloud answers with json when it couldn't decode the texture, never with pixels */
+-	if (HttpResponse->GetContentType().StartsWith("application/json")) {
+-		return false;
+-	}
+-
+-	OutData = HttpResponse->GetContent();
+-
+-	return OutData.Num() > 0;
+-}
+-
+-bool FTextureImport::FromCloud(const FString& Path, const FString& FetchPath, UTexture*& OutTexture) {
+-	if (Path.IsEmpty()) {
+-		return false;
+-	}
+-
+-	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(FetchPath);
+-	if (Response == nullptr) {
+-		return false;
+-	}
+-
+-	const TArray<TSharedPtr<FJsonValue>> Exports = Response->GetArrayField(TEXT("exports"));
+-	if (Exports.Num() == 0) {
+-		return false;
+-	}
+-
+-	const TSharedPtr<FJsonObject> Export = Exports[0]->AsObject();
+-	const FString Type = Export->GetStringField(TEXT("Type"));
+-
+-	TArray<uint8> Data;
+-
+-	if (FTextureTypes::HasPixelPayload(Type) && !DownloadPixels(FetchPath, Type, Export, Data)) {
+-		return false;
+-	}
+-
+-	return FromExport(Export, Path, Type, Data, OutTexture);
+-}
+-
+-bool FTextureImport::FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture) {
+-	const UReflectionSettings* Settings = GetSettings();
+-
+-	FString PackagePath;
+-	FString AssetName; {
+-		Path.Split(".", &PackagePath, &AssetName);
+-	}
+-
+-	FRRedirects::Redirect(PackagePath);
+-
+-	/* Missing Plugin: Create it */
+-	if (!PackagePath.StartsWith("/Game/") && !PackagePath.StartsWith("/Engine/")) {
+-		FString PluginName;
+-		PackagePath.Split("/", nullptr, &PluginName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+-		PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+-
+-		if (GetPlugin(PluginName) == nullptr) {
+-			CreatePlugin(PluginName);
+-		}
+-	}
+-
+-	UPackage* Package = FAssetUtilities::CreateAssetPackage(*PackagePath);
+-	Package->FullyLoad();
+-
+-	const bool UseRawMipData = FTextureTypes::RequiresRawMipData(Type, FTextureTypes::IsVectorDisplacementMap(Export));
+-
+-	FTextureCreator TextureCreator = FTextureCreator(AssetName, Path, Package, UseRawMipData);
+-
+-	UTexture* Texture = nullptr;
+-	if (!TextureCreator.Create(Type, Export, Data, Texture) || Texture == nullptr) {
+-		return false;
+-	}
+-
+-	FAssetRegistryModule::AssetCreated(Texture);
+-	if (!Texture->MarkPackageDirty()) {
+-		return false;
+-	}
+-
+-	Package->SetDirtyFlag(true);
+-	Texture->PostEditChange();
+-	Texture->AddToRoot();
+-	Package->FullyLoad();
+-
+-	if (Settings->AssetSettings.SaveAssets) {
+-		SavePackage(Package);
+-	}
+-
+-	OutTexture = Texture;
+-
++	TObjectPtr<AssetType> T;
++	DownloadWrapper<AssetType>(T, "TextureLightProfile", GetAssetName(), GetPackage()->GetPathName());
++	
+ 	return true;
+ }
+=== FILE: Source/Reflection/Private/Importers/Types/Texture/TextureTypes.cpp ===
+diff --git a/Source/Reflection/Private/Importers/Types/Texture/TextureTypes.cpp b/Source/Reflection/Private/Importers/Types/Texture/TextureTypes.cpp
+deleted file mode 100644
+index 77f4382..0000000
+--- a/Source/Reflection/Private/Importers/Types/Texture/TextureTypes.cpp
++++ /dev/null
+@@ -1,61 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Importers/Types/Texture/TextureTypes.h"
+-
+-const TArray<FString>& FTextureTypes::All() {
+-	static const TArray<FString> Types = {
+-		TEXT("Texture2D"),
+-		TEXT("Texture2DArray"),
+-		TEXT("TextureCube"),
+-		TEXT("VolumeTexture"),
+-		TEXT("TextureRenderTarget2D"),
+-		TEXT("TextureLightProfile"),
+-	};
+-
+-	return Types;
+-}
+-
+-bool FTextureTypes::IsSupported(const FString& Type) {
+-	return All().Contains(Type);
+-}
+-
+-bool FTextureTypes::HasPixelPayload(const FString& Type) {
+-	return Type != TEXT("TextureRenderTarget2D");
+-}
+-
+-bool FTextureTypes::RequiresRawMipData(const FString& Type, const bool bIsVectorDisplacementMap) {
+-#if PLATFORM_LINUX
+-	/* detex and nvtt are Windows only here, so Linux has to make do with the encoded image */
+-	return false;
+-#elif UE4_26_BELOW || UE5_5_BEYOND
+-	/* Outside 4.27 through 5.4 the texture factory doesn't line up, so everything goes raw */
+-	return true;
+-#else
+-	/* A cube is six faces, a volume is a stack of slices and an array is a pile of them, none of
+-	 * which survives being encoded down to one flat image. Light profiles are 16 bit and would
+-	 * lose their curve. */
+-	if (Type == TEXT("Texture2DArray")
+-	 || Type == TEXT("TextureCube")
+-	 || Type == TEXT("VolumeTexture")
+-	 || Type == TEXT("TextureLightProfile")) {
+-		return true;
+-	}
+-
+-	return bIsVectorDisplacementMap;
+-#endif
+-}
+-
+-bool FTextureTypes::IsVectorDisplacementMap(const TSharedPtr<FJsonObject>& Export) {
+-	const TSharedPtr<FJsonObject>* Properties;
+-	if (!Export.IsValid() || !Export->TryGetObjectField(TEXT("Properties"), Properties)) {
+-		return false;
+-	}
+-
+-	FString CompressionSettings;
+-	if (!(*Properties)->TryGetStringField(TEXT("CompressionSettings"), CompressionSettings)) {
+-		return false;
+-	}
+-
+-	return CompressionSettings.Contains(TEXT("TC_VectorDisplacementmap"))
+-		|| CompressionSettings.Contains(TEXT("TC_HDR"));
+-}
+=== FILE: Source/Reflection/Private/Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.cpp ===
+diff --git a/Source/Reflection/Private/Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.cpp b/Source/Reflection/Private/Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.cpp
+index a8567f9..8bf91d6 100644
+--- a/Source/Reflection/Private/Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.cpp
++++ b/Source/Reflection/Private/Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.cpp
+@@ -6,7 +6,6 @@
+ 
+ #include "Modules/Cloud/Cloud.h"
+ #include "Modules/Tools/ToolRegistry.h"
+-#include "Modules/Toolbar/Tools/ImportFromPath.h"
+ 
+ /* Every tool registers from its own header, so including them is what puts them in the menu */
+ #include "Modules/Cloud/Tools/AnimationData.h"
+@@ -17,31 +16,7 @@
+ #include "Modules/Cloud/Tools/WidgetAnimations.h"
+ 
+ void ICloudToolsDropdownBuilder::Build(FMenuBuilder& MenuBuilder) const {
+-	/* Everything in the section below works off whatever is selected in the content browser.
+-	 * Fetching by path doesn't, so it sits on its own rather than pretending to belong. */
+-	MenuBuilder.BeginSection("ReflectionCloudReflectSection", FText::FromString("Reflection"));
+-
+-	MenuBuilder.AddMenuEntry(
+-		FText::FromString("Reflect"),
+-		FText::FromString("Reflect an asset out of Cloud by its path, with nothing selected"),
+-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "ContentBrowser.AssetTreeFolderOpen"),
+-
+-		FUIAction(
+-			FExecuteAction::CreateLambda([] {
+-				TToolImportFromPath* Tool = new TToolImportFromPath();
+-				Tool->Execute();
+-			}),
+-
+-			FCanExecuteAction::CreateLambda([] {
+-				return Cloud::Status::IsOpened();
+-			})
+-		),
+-		NAME_None
+-	);
+-
+-	MenuBuilder.EndSection();
+-
+-	MenuBuilder.BeginSection("ReflectionCloudSection", FText::FromString("Selected Assets"));
++	MenuBuilder.BeginSection("ReflectionCloudSection", FText::FromString("Cloud"));
+ 
+ 	TArray<TSelectedAssetsBase*> Tools;
+ 
+=== FILE: Source/Reflection/Private/Modules/Toolbar/Dropdowns/GeneralDropdownBuilder.cpp ===
+diff --git a/Source/Reflection/Private/Modules/Toolbar/Dropdowns/GeneralDropdownBuilder.cpp b/Source/Reflection/Private/Modules/Toolbar/Dropdowns/GeneralDropdownBuilder.cpp
+index 112a6ba..2ad2851 100644
+--- a/Source/Reflection/Private/Modules/Toolbar/Dropdowns/GeneralDropdownBuilder.cpp
++++ b/Source/Reflection/Private/Modules/Toolbar/Dropdowns/GeneralDropdownBuilder.cpp
+@@ -5,25 +5,7 @@
+ #include "Engine/Compatibility.h"
+ #include "Engine/EngineUtilities.h"
+ 
+-#include "Modules/UI/SupportedAssets/SupportedAssetsTab.h"
+-
+ void IGeneralDropdownBuilder::Build(FMenuBuilder& MenuBuilder) const {
+-	MenuBuilder.AddMenuEntry(
+-		FText::FromString("Supported Assets"),
+-		FText::FromString("Every asset type Reflection can build"),
+-#if ENGINE_UE5
+-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Help"),
+-#else
+-		FSlateIcon(FEditorStyle::GetStyleSetName(), "LevelEditor.BspMode"),
+-#endif
+-		FUIAction(
+-			FExecuteAction::CreateLambda([]() {
+-				FSupportedAssetsTab::Open();
+-			})
+-		),
+-		NAME_None
+-	);
+-
+ 	MenuBuilder.AddMenuEntry(
+ 		FText::FromString("Plugin Settings"),
+ 		FText::FromString("Navigate to Plugin Settings"),
+=== FILE: Source/Reflection/Private/Modules/Toolbar/Tools/ImportFromPath.cpp ===
+diff --git a/Source/Reflection/Private/Modules/Toolbar/Tools/ImportFromPath.cpp b/Source/Reflection/Private/Modules/Toolbar/Tools/ImportFromPath.cpp
+deleted file mode 100644
+index 928c321..0000000
+--- a/Source/Reflection/Private/Modules/Toolbar/Tools/ImportFromPath.cpp
++++ /dev/null
+@@ -1,136 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Modules/Toolbar/Tools/ImportFromPath.h"
+-
+-#include "Containers/Export.h"
+-#include "Importers/Constructor/ImportReader.h"
+-#include "Importers/Types/Texture/TextureImporter.h"
+-#include "Importers/Types/Texture/TextureTypes.h"
+-#include "Modules/Cloud/Cloud.h"
+-#include "Modules/Cloud/Remote.h"
+-#include "Engine/EngineUtilities.h"
+-#include "Utilities/AssetPaths.h"
+-#include "Utilities/Dialog.h"
+-
+-void TToolImportFromPath::Execute() {
+-	if (!Cloud::Status::IsOpened()) {
+-		SpawnPrompt("Reflect From Path", "Cloud isn't running, so there is nowhere to fetch from.");
+-
+-		return;
+-	}
+-
+-	/* The path is usually already on the clipboard, straight out of the asset it was copied from */
+-	FString Paths = GetClipboard();
+-	if (!Paths.Contains(TEXT("/"))) {
+-		Paths.Empty();
+-	}
+-
+-	/* The example writes itself out of whatever profile Cloud has loaded */
+-	const UReflectionSettings* Settings = GetSettings();
+-
+-	const FString ProjectName = Settings->AssetSettings.ProjectName.IsEmpty()
+-		? TEXT("Project")
+-		: Settings->AssetSettings.ProjectName;
+-
+-	if (!SpawnTextEntryPrompt(
+-		TEXT("Reflect From Path"),
+-		FString::Printf(TEXT("One asset path per line, as Cloud knows it:\n\n%s/Content/Path/To/Asset"), *ProjectName),
+-		Paths)) {
+-		return;
+-	}
+-
+-	TArray<FString> Lines;
+-	Paths.ParseIntoArrayLines(Lines);
+-
+-	int32 Reflected = 0;
+-	int32 Attempted = 0;
+-
+-	for (const FString& Line : Lines) {
+-		if (Line.TrimStartAndEnd().IsEmpty()) continue;
+-
+-		Attempted++;
+-
+-		if (Import(Line)) {
+-			Reflected++;
+-		}
+-	}
+-
+-	if (Attempted == 0) {
+-		return;
+-	}
+-
+-	const bool Successful = Reflected == Attempted;
+-
+-	AppendNotification(
+-		FText::FromString(Successful ? "Reflected From Path" : "Reflected With Failures"),
+-		FText::FromString(FString::Printf(TEXT("%d of %d"), Reflected, Attempted)),
+-		Successful ? 2.0f : 5.0f,
+-		Successful ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail,
+-		true,
+-		310.0f
+-	);
+-}
+-
+-bool TToolImportFromPath::Import(const FString& InPath) {
+-	/* Take whatever gets pasted: Type'/Game/Path/Asset.Asset', a path with an extension on it,
+-	 * or a bare package path */
+-	FString PackagePath = StripObjectOuter(InPath.TrimStartAndEnd());
+-	PackagePath.ReplaceInline(TEXT("\\"), TEXT("/"));
+-
+-	/* Cloud cuts everything from the first dot, so an export name or an extension makes no
+-	 * difference to it, and the editor path below has to be cut the same way to match */
+-	int32 Dot;
+-	if (PackagePath.FindChar(TEXT('.'), Dot)) {
+-		PackagePath.LeftInline(Dot);
+-	}
+-
+-	PackagePath.TrimStartAndEndInline();
+-
+-	if (PackagePath.IsEmpty()) {
+-		return false;
+-	}
+-
+-	/* Reached straight off a menu click, so nothing here has a continuation to hand a callback to.
+-	 * The scope is what keeps the editor drawn and cancellable while the requests run. */
+-	const FBlockingRequestScope BlockingScope(FText::Format(
+-		NSLOCTEXT("Reflection", "ReflectingPath", "Reflecting {0}"),
+-		FText::FromString(PackagePath)
+-	));
+-
+-	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(PackagePath);
+-	if (Response == nullptr || !Response->HasField(TEXT("exports"))) {
+-		UE_LOG(LogReflection, Error, TEXT("Cloud has nothing at \"%s\""), *PackagePath);
+-
+-		return false;
+-	}
+-
+-	const TArray<TSharedPtr<FJsonValue>> Exports = Response->GetArrayField(TEXT("exports"));
+-	if (Exports.Num() == 0) {
+-		UE_LOG(LogReflection, Error, TEXT("Cloud has nothing at \"%s\""), *PackagePath);
+-
+-		return false;
+-	}
+-
+-	const TSharedPtr<FJsonObject> Export = Exports[0]->AsObject();
+-
+-	FString Type;
+-	if (!Export.IsValid() || !Export->TryGetStringField(TEXT("Type"), Type)) {
+-		return false;
+-	}
+-
+-	/* Where it lands in the editor */
+-	const FString ObjectPath = ToEditorPackagePath(PackagePath);
+-
+-	FString AssetName;
+-	ObjectPath.Split(TEXT("/"), nullptr, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+-
+-	if (FTextureTypes::IsSupported(Type)) {
+-		UTexture* Texture = nullptr;
+-
+-		return FTextureImport::FromCloud(ObjectPath + "." + AssetName, PackagePath, Texture);
+-	}
+-
+-	IImporter* OutImporter = nullptr;
+-
+-	return IImportReader::ReadExportsAndImport(Exports, ObjectPath, OutImporter);
+-}
+=== FILE: Source/Reflection/Private/Modules/UI/SupportedAssets/SSupportedAssetsPanel.cpp ===
+diff --git a/Source/Reflection/Private/Modules/UI/SupportedAssets/SSupportedAssetsPanel.cpp b/Source/Reflection/Private/Modules/UI/SupportedAssets/SSupportedAssetsPanel.cpp
+deleted file mode 100644
+index 8e2291b..0000000
+--- a/Source/Reflection/Private/Modules/UI/SupportedAssets/SSupportedAssetsPanel.cpp
++++ /dev/null
+@@ -1,257 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Modules/UI/SupportedAssets/SSupportedAssetsPanel.h"
+-
+-#include "Importers/Constructor/Types.h"
+-#include "Importers/Constructor/Registry/RegistrationInfo.h"
+-#include "Importers/Types/Texture/TextureTypes.h"
+-
+-#include "Engine/Compatibility.h"
+-#include "Engine/EngineUtilities.h"
+-
+-#include "Styling/SlateIconFinder.h"
+-#include "Widgets/Images/SImage.h"
+-#include "Widgets/Input/SSearchBox.h"
+-#include "Widgets/Layout/SBorder.h"
+-#include "Widgets/SBoxPanel.h"
+-#include "Widgets/Text/STextBlock.h"
+-#include "Widgets/Views/SHeaderRow.h"
+-#include "Widgets/Views/STableRow.h"
+-
+-#define LOCTEXT_NAMESPACE "Reflection.SupportedAssets"
+-
+-/* BlueprintGeneratedClass and the like are what a cooked package calls them, but the icon and the
+- * name both belong to the class they were generated from */
+-static FString ToDisplayType(const FString& Type) {
+-	FString Display;
+-
+-	if (Type.Split(TEXT("GeneratedClass"), &Display, nullptr) && !Display.IsEmpty()) {
+-		return Display;
+-	}
+-
+-	return Type;
+-}
+-
+-/* One row of the list */
+-class SSupportedAssetRow : public SMultiColumnTableRow<TSharedPtr<FSupportedAssetEntry>> {
+-public:
+-	SLATE_BEGIN_ARGS(SSupportedAssetRow) {}
+-		SLATE_ARGUMENT(TSharedPtr<FSupportedAssetEntry>, Entry)
+-	SLATE_END_ARGS()
+-
+-	void Construct(const FArguments& InArgs, const TSharedRef<STableViewBase>& OwnerTable) {
+-		Entry = InArgs._Entry;
+-
+-		SMultiColumnTableRow::Construct(FSuperRowType::FArguments(), OwnerTable);
+-	}
+-
+-	virtual TSharedRef<SWidget> GenerateWidgetForColumn(const FName& ColumnName) override {
+-		if (!Entry.IsValid()) {
+-			return SNullWidget::NullWidget;
+-		}
+-
+-		if (ColumnName == SupportedAssetColumns::Type) {
+-			/* Looked up by name across every module, so the ones living outside Engine still
+-			 * find their icon. Falls back to the default class icon when nothing matches. */
+-			const UClass* Class = FindClassByType(Entry->DisplayType);
+-
+-			return SNew(SHorizontalBox)
+-
+-				+ SHorizontalBox::Slot()
+-				.AutoWidth()
+-				.VAlign(VAlign_Center)
+-				.Padding(4.0f, 0.0f, 6.0f, 0.0f)
+-				[
+-					SNew(SImage)
+-					.Image(FSlateIconFinder::FindIconForClass(Class).GetIcon())
+-				]
+-
+-				+ SHorizontalBox::Slot()
+-				.FillWidth(1.0f)
+-				.VAlign(VAlign_Center)
+-				[
+-					SNew(STextBlock)
+-					.Text(FText::FromString(Entry->DisplayType))
+-					.ToolTipText(FText::FromString(Entry->Type))
+-				];
+-		}
+-
+-		if (ColumnName == SupportedAssetColumns::Category) {
+-			return SNew(STextBlock)
+-				.Margin(FMargin(4.0f, 2.0f))
+-				.Text(FText::FromString(Entry->Category));
+-		}
+-
+-		if (ColumnName == SupportedAssetColumns::Importer) {
+-			return SNew(STextBlock)
+-				.Margin(FMargin(4.0f, 2.0f))
+-				.Text(FText::FromString(Entry->Importer));
+-		}
+-
+-		if (ColumnName == SupportedAssetColumns::Notes) {
+-			TArray<FString> Notes;
+-
+-			if (Entry->Experimental) Notes.Add(TEXT("Experimental"));
+-			if (Entry->CloudBlocked) Notes.Add(TEXT("Local json only"));
+-
+-			return SNew(STextBlock)
+-				.Margin(FMargin(4.0f, 2.0f))
+-				.Text(FText::FromString(FString::Join(Notes, TEXT(", "))));
+-		}
+-
+-		return SNullWidget::NullWidget;
+-	}
+-
+-private:
+-	TSharedPtr<FSupportedAssetEntry> Entry;
+-};
+-
+-void SSupportedAssetsPanel::Construct(const FArguments& InArgs) {
+-	Refresh();
+-
+-	ChildSlot
+-	[
+-		SNew(SBorder)
+-		.Padding(8.0f)
+-		[
+-			SNew(SVerticalBox)
+-
+-			+ SVerticalBox::Slot()
+-			.AutoHeight()
+-			.Padding(0.0f, 0.0f, 0.0f, 6.0f)
+-			[
+-				SNew(SSearchBox)
+-				.HintText(LOCTEXT("SearchHint", "Search asset types"))
+-				.OnTextChanged(this, &SSupportedAssetsPanel::OnSearchChanged)
+-			]
+-
+-			+ SVerticalBox::Slot()
+-			.FillHeight(1.0f)
+-			[
+-				SAssignNew(ListView, SListView<TSharedPtr<FSupportedAssetEntry>>)
+-				.ListItemsSource(&VisibleEntries)
+-				.SelectionMode(ESelectionMode::Single)
+-				.OnGenerateRow(this, &SSupportedAssetsPanel::GenerateRow)
+-				.HeaderRow(
+-					SNew(SHeaderRow)
+-
+-					+ SHeaderRow::Column(SupportedAssetColumns::Type)
+-					.DefaultLabel(LOCTEXT("TypeColumn", "Asset Type"))
+-					.FillWidth(0.35f)
+-
+-					+ SHeaderRow::Column(SupportedAssetColumns::Category)
+-					.DefaultLabel(LOCTEXT("CategoryColumn", "Category"))
+-					.FillWidth(0.25f)
+-
+-					+ SHeaderRow::Column(SupportedAssetColumns::Importer)
+-					.DefaultLabel(LOCTEXT("ImporterColumn", "Importer"))
+-					.FillWidth(0.2f)
+-
+-					+ SHeaderRow::Column(SupportedAssetColumns::Notes)
+-					.DefaultLabel(LOCTEXT("NotesColumn", "Notes"))
+-					.FillWidth(0.2f)
+-				)
+-			]
+-
+-			+ SVerticalBox::Slot()
+-			.AutoHeight()
+-			.Padding(4.0f, 8.0f, 0.0f, 0.0f)
+-			[
+-				SNew(STextBlock)
+-				.Text(this, &SSupportedAssetsPanel::GetSummaryText)
+-			]
+-		]
+-	];
+-}
+-
+-void SSupportedAssetsPanel::Refresh() {
+-	AllEntries.Reset();
+-
+-	/* Keyed on type, because a type can be reached more than one way and the first claim wins */
+-	TMap<FString, TSharedPtr<FSupportedAssetEntry>> Seen;
+-
+-	const auto Add = [&Seen, this](const FString& Type, const FString& Category, const FString& Importer) {
+-		if (Type.IsEmpty() || Seen.Contains(Type)) return;
+-
+-		TSharedPtr<FSupportedAssetEntry> Entry = MakeShared<FSupportedAssetEntry>();
+-
+-		Entry->Type = Type;
+-		Entry->DisplayType = ToDisplayType(Type);
+-		Entry->Category = Category;
+-		Entry->Importer = Importer;
+-		Entry->Experimental = ImportTypes::Experimental.Contains(Type);
+-		Entry->CloudBlocked = ImportTypes::Cloud::Blacklisted.Contains(Type);
+-
+-		Seen.Add(Type, Entry);
+-		AllEntries.Add(Entry);
+-	};
+-
+-	/* Types with an importer of their own */
+-	for (const TPair<TArray<FString>, FImporterRegistrationInfo>& Registration : GetFactoryRegistry()) {
+-		for (const FString& Type : Registration.Key) {
+-			Add(Type, Registration.Value.Category, TEXT("Dedicated"));
+-		}
+-	}
+-
+-	/* Types the templated importer covers by deserializing their properties straight across */
+-	for (const TPair<FString, TArray<FString>>& Pair : ImportTypes::Templated) {
+-		for (const FString& Type : Pair.Value) {
+-			Add(Type, Pair.Key, TEXT("Templated"));
+-		}
+-	}
+-
+-	/* Textures are rebuilt from pixels rather than properties, so they sit outside both */
+-	for (const FString& Type : FTextureTypes::All()) {
+-		Add(Type, TEXT("Texture Assets"), TEXT("Texture"));
+-	}
+-
+-	AllEntries.Sort([](const TSharedPtr<FSupportedAssetEntry>& A, const TSharedPtr<FSupportedAssetEntry>& B) {
+-		if (A->Category != B->Category) {
+-			return A->Category < B->Category;
+-		}
+-
+-		/* Sorted the way it reads, not the way it's stored */
+-		return A->DisplayType < B->DisplayType;
+-	});
+-
+-	ApplyFilter();
+-}
+-
+-void SSupportedAssetsPanel::OnSearchChanged(const FText& Text) {
+-	SearchText = Text.ToString().TrimStartAndEnd();
+-
+-	ApplyFilter();
+-}
+-
+-void SSupportedAssetsPanel::ApplyFilter() {
+-	VisibleEntries.Reset();
+-
+-	for (const TSharedPtr<FSupportedAssetEntry>& Entry : AllEntries) {
+-		/* Matched against the full type too, so searching the name off a Cloud export still lands */
+-		if (SearchText.IsEmpty()
+-			|| Entry->Type.Contains(SearchText)
+-			|| Entry->DisplayType.Contains(SearchText)
+-			|| Entry->Category.Contains(SearchText)) {
+-			VisibleEntries.Add(Entry);
+-		}
+-	}
+-
+-	if (ListView.IsValid()) {
+-		ListView->RequestListRefresh();
+-	}
+-}
+-
+-FText SSupportedAssetsPanel::GetSummaryText() const {
+-	/* Data assets never get listed one by one, the importer takes the whole hierarchy */
+-	const FString Counts = VisibleEntries.Num() == AllEntries.Num()
+-		? FString::Printf(TEXT("%d asset types"), AllEntries.Num())
+-		: FString::Printf(TEXT("%d of %d asset types"), VisibleEntries.Num(), AllEntries.Num());
+-
+-	return FText::FromString(Counts + TEXT(", plus anything deriving from Data Asset"));
+-}
+-
+-TSharedRef<ITableRow> SSupportedAssetsPanel::GenerateRow(TSharedPtr<FSupportedAssetEntry> Entry, const TSharedRef<STableViewBase>& OwnerTable) {
+-	return SNew(SSupportedAssetRow, OwnerTable).Entry(Entry);
+-}
+-
+-#undef LOCTEXT_NAMESPACE
+=== FILE: Source/Reflection/Private/Modules/UI/SupportedAssets/SupportedAssetsTab.cpp ===
+diff --git a/Source/Reflection/Private/Modules/UI/SupportedAssets/SupportedAssetsTab.cpp b/Source/Reflection/Private/Modules/UI/SupportedAssets/SupportedAssetsTab.cpp
+deleted file mode 100644
+index 996bf72..0000000
+--- a/Source/Reflection/Private/Modules/UI/SupportedAssets/SupportedAssetsTab.cpp
++++ /dev/null
+@@ -1,57 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#include "Modules/UI/SupportedAssets/SupportedAssetsTab.h"
+-
+-#include "Modules/UI/SupportedAssets/SSupportedAssetsPanel.h"
+-#include "Modules/UI/StyleModule.h"
+-#include "Engine/Compatibility.h"
+-
+-#include "Framework/Docking/TabManager.h"
+-#include "Widgets/Docking/SDockTab.h"
+-
+-#define LOCTEXT_NAMESPACE "Reflection.SupportedAssets"
+-
+-const FName FSupportedAssetsTab::TabId(TEXT("ReflectionSupportedAssets"));
+-
+-TWeakPtr<SSupportedAssetsPanel> FSupportedAssetsTab::ActivePanel;
+-
+-void FSupportedAssetsTab::Register() {
+-	FGlobalTabmanager::Get()->RegisterNomadTabSpawner(TabId, FOnSpawnTab::CreateStatic(&FSupportedAssetsTab::Spawn))
+-		.SetDisplayName(LOCTEXT("TabTitle", "Supported Assets"))
+-		.SetTooltipText(LOCTEXT("TabTooltip", "Every asset type Reflection can build."))
+-		.SetIcon(FSlateIcon(FReflectionStyle::GetStyleSetName(), "Toolbar.Icon"))
+-		.SetMenuType(ETabSpawnerMenuType::Hidden);
+-}
+-
+-void FSupportedAssetsTab::Unregister() {
+-	FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(TabId);
+-
+-	ActivePanel.Reset();
+-}
+-
+-void FSupportedAssetsTab::Open() {
+-	/* TryInvokeTab only arrived in 4.26, InvokeTab is the same call that asserts instead */
+-#if UE4_25_BELOW
+-	FGlobalTabmanager::Get()->InvokeTab(TabId);
+-#else
+-	FGlobalTabmanager::Get()->TryInvokeTab(TabId);
+-#endif
+-
+-	/* An already open tab is holding whatever the registries looked like when it was spawned */
+-	if (const TSharedPtr<SSupportedAssetsPanel> Panel = ActivePanel.Pin()) {
+-		Panel->Refresh();
+-	}
+-}
+-
+-TSharedRef<SDockTab> FSupportedAssetsTab::Spawn(const FSpawnTabArgs& Args) {
+-	const TSharedRef<SSupportedAssetsPanel> Panel = SNew(SSupportedAssetsPanel);
+-	ActivePanel = Panel;
+-
+-	return SNew(SDockTab)
+-		.TabRole(ETabRole::NomadTab)
+-		[
+-			Panel
+-		];
+-}
+-
+-#undef LOCTEXT_NAMESPACE
+=== FILE: Source/Reflection/Private/Reflection.cpp ===
+diff --git a/Source/Reflection/Private/Reflection.cpp b/Source/Reflection/Private/Reflection.cpp
+index d6115c6..896dc6c 100644
+--- a/Source/Reflection/Private/Reflection.cpp
++++ b/Source/Reflection/Private/Reflection.cpp
+@@ -15,7 +15,6 @@
+ #include "Modules/Versioning.h"
+ 
+ #include "Modules/UI/StyleModule.h"
+-#include "Modules/UI/SupportedAssets/SupportedAssetsTab.h"
+ #include "Modules/UI/Validation/ValidationTab.h"
+ #include "Modules/Toolbar/Toolbar.h"
+ #include "Engine/EngineUtilities.h"
+@@ -38,8 +37,6 @@ void FReflectionModule::StartupModule() {
+     FReflectionStyle::ReloadTextures();
+ 
+ 	/* Register tabs, the style has to exist first for their icons */
+-	FSupportedAssetsTab::Register();
+-
+ #if ENGINE_UE5
+ 	FValidationTab::Register();
+ #endif
+@@ -83,8 +80,6 @@ void FReflectionModule::ShutdownModule() {
+ 	UToolMenus::UnregisterOwner(this);
+ #endif
+ 
+-	FSupportedAssetsTab::Unregister();
+-
+ #if ENGINE_UE5
+ 	/* The main menu bar entry is owned by the toolbar, not the module */
+ 	if (Toolbar) {
+=== FILE: Source/Reflection/Public/Engine/Compatibility.h ===
+diff --git a/Source/Reflection/Public/Engine/Compatibility.h b/Source/Reflection/Public/Engine/Compatibility.h
+index 13a1cda..c9471f6 100644
+--- a/Source/Reflection/Public/Engine/Compatibility.h
++++ b/Source/Reflection/Public/Engine/Compatibility.h
+@@ -16,7 +16,6 @@
+ #ifndef REFLECTION_EXPERIMENTAL
+ #define REFLECTION_EXPERIMENTAL 0
+ 
+-#include "Engine/Texture2DArray.h"
+ #include "Engine/TextureCube.h"
+ #include "Engine/VolumeTexture.h"
+ 
+@@ -452,16 +451,7 @@ inline FTexturePlatformData* GetPlatformData(UTexture* Texture) {
+ 		return VolumeTexture->PlatformData;
+ #endif
+ 	}
+-
+-	/* Derives from UTexture rather than UTexture2D, so the cast above never catches it */
+-	if (UTexture2DArray* Texture2DArray = Cast<UTexture2DArray>(Texture)) {
+-#if ENGINE_UE5
+-		return Texture2DArray->GetPlatformData();
+-#else
+-		return Texture2DArray->PlatformData;
+-#endif
+-	}
+-
++	
+ 	return nullptr;
+ }
+ 
+@@ -487,14 +477,6 @@ inline void SetPlatformData(UTexture* Texture, FTexturePlatformData* PlatformDat
+ 		VolumeTexture->SetPlatformData(PlatformData);
+ #else
+ 		VolumeTexture->PlatformData = PlatformData;
+-#endif
+-	}
+-
+-	if (UTexture2DArray* Texture2DArray = Cast<UTexture2DArray>(Texture)) {
+-#if ENGINE_UE5
+-		Texture2DArray->SetPlatformData(PlatformData);
+-#else
+-		Texture2DArray->PlatformData = PlatformData;
+ #endif
+ 	}
+ }
+=== FILE: Source/Reflection/Public/Importers/Constructor/Asset.h ===
+diff --git a/Source/Reflection/Public/Importers/Constructor/Asset.h b/Source/Reflection/Public/Importers/Constructor/Asset.h
+index bb0cb1a..eb8e590 100644
+--- a/Source/Reflection/Public/Importers/Constructor/Asset.h
++++ b/Source/Reflection/Public/Importers/Constructor/Asset.h
+@@ -14,6 +14,6 @@ public:
+ 	template <class T = UObject>
+ 	static bool ConstructAsset(const FString& Path, const FString& RealPath, const FString& Type, TObjectPtr<T>& OutObject, bool& bSuccess);
+ 	
+-	/* Kept for the tools already calling it, see FTextureImport for the rest of the texture path */
++	static bool Construct_TypeTexture(const FString& Path, const FString& FetchPath, UTexture*& OutTexture);
+ 	static bool Fast_Construct_TypeTexture(const TSharedPtr<FJsonObject>& JsonExport, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture);
+ };
+=== FILE: Source/Reflection/Public/Importers/Constructor/Importer.h ===
+diff --git a/Source/Reflection/Public/Importers/Constructor/Importer.h b/Source/Reflection/Public/Importers/Constructor/Importer.h
+index 8234d34..0f1ba78 100644
+--- a/Source/Reflection/Public/Importers/Constructor/Importer.h
++++ b/Source/Reflection/Public/Importers/Constructor/Importer.h
+@@ -17,7 +17,6 @@
+ #include "Styling/SlateIconFinder.h"
+ #include "Importers/Constructor/Asset.h"
+ #include "Engine/Package.h"
+-#include "Utilities/AssetPaths.h"
+ 
+ /* Base handler for converting JSON to assets */
+ class REFLECTION_API IImporter : public USerializerContainer {
+@@ -128,22 +127,30 @@ void IImporter::LoadExport(const TSharedPtr<FJsonObject>* PackageIndex, TObjectP
+ 	ObjectPath = PackageIndex->Get()->GetStringField(TEXT("ObjectPath"));
+ 	ObjectPath.Split(".", &ObjectPath, nullptr);
+ 
++	const UReflectionSettings* Settings = GetSettings();
++
++	if (!Settings->AssetSettings.ProjectName.IsEmpty()) {
++		ObjectPath = ObjectPath.Replace(*(Settings->AssetSettings.ProjectName + "/Content/"), TEXT("/Game/"));
++		ObjectPath = ObjectPath.Replace(*(Settings->AssetSettings.ProjectName + "/Plugins"), TEXT(""));
++		ObjectPath = ObjectPath.Replace(TEXT("/Content/"), TEXT("/"));
++	}
++
++	ObjectPath = ObjectPath.Replace(TEXT("Engine/Content"), TEXT("/Engine"));
+ 	ObjectName = ObjectName.Replace(TEXT("'"), TEXT(""));
+ 
+-	/* Subobjects nest arbitrarily deep, so only the last segment names the export and the one
+-	 * before it is its outer. Peeling a fixed number of segments off the front leaves anything
+-	 * deeper than two levels unresolvable: a reroute inside a composite's subgraph comes through
+-	 * as Material:MaterialGraph_1.MaterialGraphNode_Composite_0.<Subgraph>.Reroute_8, and used to
+-	 * come out of here still carrying "<Subgraph>." in front of its name. */
+ 	if (ObjectName.Contains(".")) {
+-		FString Chain;
+-		ObjectName.Split(".", &Chain, &ObjectName, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
++		ObjectName.Split(".", nullptr, &ObjectName);
++	}
++
++	if (ObjectName.Contains(".")) {
++		ObjectName.Split(".", &Outer, &ObjectName);
++	}
+ 
+-		/* Leaves Outer alone when there is nothing in front of the leaf but the asset itself */
+-		Chain.Split(".", nullptr, &Outer, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
++	if (!ObjectPath.StartsWith(TEXT("/"))) {
++		ObjectPath = "/" + ObjectPath;
+ 	}
+ 
+-	ObjectPath = ToEditorPackagePath(ObjectPath);
++	FRRedirects::Redirect(ObjectPath);
+ 
+ 	/* Try to load object using the object path and the object name combined */
+ 	TObjectPtr<T> LoadedObject = LoadObjectByPath<T>(ObjectPath + "." + ObjectName);
+=== FILE: Source/Reflection/Public/Importers/Constructor/Types.h ===
+diff --git a/Source/Reflection/Public/Importers/Constructor/Types.h b/Source/Reflection/Public/Importers/Constructor/Types.h
+index 37046b3..ab29e80 100644
+--- a/Source/Reflection/Public/Importers/Constructor/Types.h
++++ b/Source/Reflection/Public/Importers/Constructor/Types.h
+@@ -15,6 +15,10 @@ struct ImportTypes {
+ 			"WidgetBlueprintGeneratedClass",
+ 		};
+ 
++		static inline TArray<FString> Extra = {
++			"TextureLightProfile"
++		};
++
+ 		static bool Allowed(const FString& Type);
+ 	};
+ 
+=== FILE: Source/Reflection/Public/Importers/Types/Animation/PoseAssetImporter.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Animation/PoseAssetImporter.h b/Source/Reflection/Public/Importers/Types/Animation/PoseAssetImporter.h
+index d77c9c9..3651c86 100644
+--- a/Source/Reflection/Public/Importers/Types/Animation/PoseAssetImporter.h
++++ b/Source/Reflection/Public/Importers/Types/Animation/PoseAssetImporter.h
+@@ -14,14 +14,6 @@ public:
+ protected:
+ 	void ReverseCookLocalSpacePose(USkeleton* Skeleton) const;
+ 	static UAnimSequence* CreateAnimSequenceFromPose(USkeleton* Skeleton, const FString& SequenceName, const TSharedPtr<FJsonObject>& PoseContainer, UPackage* Outer);
+-
+-	/* The reference pose of the skeleton this asset was cooked against, keyed by bone name.
+-	 *
+-	 * Read from Cloud rather than from the skeleton in the project. A pose stores only its
+-	 * difference from the reference pose, so the wrong reference bends every bone it touches, and
+-	 * the parent skeleton moves around enough between builds that the one sitting in the project
+-	 * is rarely the one the pose was built on. Names survive that, bone order doesn't. */
+-	TMap<FName, FTransform> GetCookedReferencePose() const;
+ };
+ 
+ REGISTER_IMPORTER(IPoseAssetImporter, TArray<FString>{ 
+=== FILE: Source/Reflection/Public/Importers/Types/Blueprint/BlueprintImporter.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintImporter.h b/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintImporter.h
+index 7946318..7056a68 100644
+--- a/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintImporter.h
++++ b/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintImporter.h
+@@ -14,10 +14,6 @@ public:
+ 	virtual bool Import() override;
+ 	
+ protected:
+-	/* Recreates the variables the blueprint declares, returns how many were added.
+-	 * Not const, reading the export off the container isn't. */
+-	int32 ConstructVariables();
+-
+ 	/* Handles SimpleConstructionScript, the component layout for Actor blueprints */
+ 	void ConstructScript() const;
+ 
+=== FILE: Source/Reflection/Public/Importers/Types/Blueprint/BlueprintVariables.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintVariables.h b/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintVariables.h
+deleted file mode 100644
+index ae7deb3..0000000
+--- a/Source/Reflection/Public/Importers/Types/Blueprint/BlueprintVariables.h
++++ /dev/null
+@@ -1,31 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-#include "EdGraph/EdGraphPin.h"
+-#include "Dom/JsonObject.h"
+-
+-class UBlueprint;
+-
+-/* Rebuilds the variables a blueprint declares.
+- *
+- * A blueprint is created from its parent class, so it starts out with only what the parent gave
+- * it. Everything the blueprint added itself lives in the generated class's ChildProperties, and
+- * until those exist as member variables there is nowhere for their defaults to land: the class
+- * default object carries values for properties the recreated blueprint doesn't have, and setting
+- * them quietly does nothing.
+- *
+- * ChildProperties also holds the blueprint's plumbing, the ubergraph frame and every anim graph
+- * node's state. Only the entries a user would see in the editor are turned into variables. */
+-struct REFLECTION_API FBlueprintVariables {
+-	/* Adds a member variable for every user facing ChildProperty, returns how many were added */
+-	static int32 Construct(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>& ChildProperties);
+-
+-	/* Whether a ChildProperty is one the editor would show rather than blueprint plumbing */
+-	static bool IsUserVariable(const TSharedPtr<FJsonObject>& Property);
+-
+-	/* Resolves a ChildProperty to the pin type a blueprint variable is declared with.
+-	 * False when the type isn't one that maps onto a blueprint variable. */
+-	static bool GetPinType(const TSharedPtr<FJsonObject>& Property, FEdGraphPinType& OutPinType);
+-};
+=== FILE: Source/Reflection/Public/Importers/Types/Texture/TextureCreator.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Texture/TextureCreator.h b/Source/Reflection/Public/Importers/Types/Texture/TextureCreator.h
+index 6affb82..e4217f3 100644
+--- a/Source/Reflection/Public/Importers/Types/Texture/TextureCreator.h
++++ b/Source/Reflection/Public/Importers/Types/Texture/TextureCreator.h
+@@ -2,44 +2,38 @@
+ 
+ #pragma once
+ 
+-#include "Importers/Types/Texture/TextureFormats.h"
+-#include "Importers/Types/Texture/TextureTypes.h"
+ #include "Serializers/PropertySerializer.h"
+-#include "Engine/Texture2D.h"
+ #include "Dom/JsonObject.h"
+ 
+-/* The size and format an export was cooked at, once the stacked payload has been unfolded */
+-struct FTextureCookedLayout {
+-	int32 SizeX = 0;
+-
+-	/* One slice, not the stacked height the export reports */
+-	int32 SizeY = 0;
+-
+-	/* Slices stacked into the payload: 1 for a flat texture, 6 for a cube, the depth for a volume */
+-	int32 SizeZ = 1;
+-
+-	/* A volume loses depth with every mip, a cube keeps its six faces all the way down */
+-	bool SlicesHalvePerMip = false;
+-
+-	EPixelFormat PixelFormat = PF_Unknown;
+-	FTextureSourceLayout Source;
+-
+-	/* Bytes the whole payload takes up at this size */
+-	int64 GetEncodedSize() const;
+-
+-	/* Steps down to the next mip, false once there is nothing left to step down to */
+-	bool DropMip();
+-};
++inline bool ShouldUseOctetStream(
++	const FString& Type,
++	const bool IsVectorDisplacementMap)
++{
++#if PLATFORM_LINUX
++	return false;
++#else
++	
++#if UE4_26_BELOW || UE5_5_BEYOND
++	return true;
++#else
++	
++	if (Type == "TextureLightProfile"
++	 || Type == "TextureCube"
++	 || Type == "VolumeTexture"
++	 || Type == "TextureRenderTarget2D")
++	{
++		return true;
++	}
++	
++	return IsVectorDisplacementMap;
++#endif
++#endif
++}
+ 
+-/* Builds one texture asset out of a Cloud export.
+- *
+- * Every creator takes the export object itself rather than its properties, because a texture is
+- * described at both levels: the UPROPERTYs sit under "Properties", while the cooked size, pixel
+- * format and mip description sit on the export next to it. */
+-struct FTextureCreator {
++struct FTextureCreatorUtilities {
+ public:
+-	FTextureCreator(const FString& AssetName, const FString& FilePath, UPackage* Package, const bool UseRawMipData)
+-		: UseRawMipData(UseRawMipData), AssetName(AssetName), FilePath(FilePath), Package(Package)
++	FTextureCreatorUtilities(const FString& AssetName, const FString& FilePath, UPackage* Package, const bool UseOctetStream)
++		: UseOctetStream(UseOctetStream), AssetName(AssetName), FilePath(FilePath), Package(Package)
+ 	{
+ 		PropertySerializer = NewObject<UPropertySerializer>();
+ 		ObjectSerializer = NewObject<UObjectSerializer>();
+@@ -47,63 +41,23 @@ public:
+ 		ObjectSerializer->SetPropertySerializer(PropertySerializer);
+ 	}
+ 
+-	/* Builds whichever texture class Type names, false when it names none of them */
+-	bool Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture);
+-
+-	/* Whether the payload holds raw mip bytes rather than an encoded image */
+-	bool IsRawMipData() const;
+-
+-private:
+-	/* Complains on behalf of the classes that can't be rebuilt from an encoded image */
+-	bool RequireRawMipData(const TCHAR* What) const;
+-
+-	/* Texture2D and the classes deriving from it, either handed to the texture factory or rebuilt by hand */
+-	template <class T = UTexture2D>
+-	bool CreateTexture2D(UTexture*& OutTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
+-
+-	bool CreateTexture2DArray(UTexture*& OutTexture2DArray, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
+-	bool CreateTextureCube(UTexture*& OutTextureCube, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
+-	bool CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
+-	bool CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const TSharedPtr<FJsonObject>& Export);
+-
+-	/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Source data ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+-
+-	/* Reads back the size and pixel format the export was cooked at.
+-	 *
+-	 * Cloud stacks the slices of a cube or a volume vertically into one tall image, so SizeY comes
+-	 * back as SizeY * SizeZ and has to be unfolded. FallbackSlices covers Cloud builds too old to
+-	 * send a slice count: pass the count for classes that have a fixed one, or zero to work it out
+-	 * from the width on the assumption that the slices are square. */
+-	bool GetCookedLayout(const TSharedPtr<FJsonObject>& Export, int32 FallbackSlices, FTextureCookedLayout& OutCooked) const;
+-
+-	/* The same, for classes whose slices sit one after another with SizeY left alone.
+-	 *
+-	 * A texture array is stored that way rather than stacked, so its height needs no unfolding and
+-	 * the count has to be read off the export instead of divided out of the height. */
+-	bool GetCookedArrayLayout(const TSharedPtr<FJsonObject>& Export, FTextureCookedLayout& OutCooked) const;
++	bool UseOctetStream = true;
+ 
+-	/* Shared tail of both: pixel format, source layout and the sanity check over the lot */
+-	bool ReadCookedLayout(const TSharedPtr<FJsonObject>& Export, int32 SizeX, int32 SizeY, int32 Slices, FTextureCookedLayout& OutCooked) const;
++	bool IsOctetStreamEnabled() const;
+ 
+-	/* The slice count an export reports, from PackedData or the older standalone field */
+-	static int32 GetReportedSliceCount(const TSharedPtr<FJsonObject>& Export);
++    template <class T = UObject>
++	bool CreateTexture(UTexture*& OutTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties);
++	bool CreateTextureCube(UTexture*& OutTextureCube, const TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties) const;
++	bool CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Properties) const;
++	bool CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const TSharedPtr<FJsonObject>& Properties) const;
+ 
+-	/* Decodes the raw first mip, slice by slice, into the texture's source data */
+-	bool BuildSourceFromRawMip(UTexture* Texture, const TArray<uint8>& Data, const FTextureCookedLayout& Cooked) const;
++	/* Deserialization functions */
++	bool DeserializeTexture2D(UTexture2D* InTexture2D, const TSharedPtr<FJsonObject>& Properties) const;
++	bool DeserializeTexture(UTexture* Texture, const TSharedPtr<FJsonObject>& Properties) const;
++	bool DeserializeTexturePlatformData(UTexture* Texture, TArray<uint8>& Data, FTexturePlatformData& TexturePlatformData, const TSharedPtr<FJsonObject>& Properties);
+ 
+-	/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Deserialization ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+-
+-	/* The UPROPERTYs shared by every texture class */
+-	void DeserializeTexture(UTexture* Texture, const TSharedPtr<FJsonObject>& Export) const;
+-	void DeserializeTexture2D(UTexture2D* Texture2D, const TSharedPtr<FJsonObject>& Export) const;
+-
+-	/* Cloud only ever sends the top mip, so anything with just the one can't generate the rest */
+-	static bool HasSingleMip(const TSharedPtr<FJsonObject>& Export);
+-
+-	/* The properties of an export, or an empty object when it carries none */
+-	static TSharedPtr<FJsonObject> GetProperties(const TSharedPtr<FJsonObject>& Export);
+-
+-	bool UseRawMipData = true;
++private:
++	static void GetDecompressedTextureData(uint8* Data, uint8*& OutData, const int SizeX, const int SizeY, const int SizeZ, const int TotalSize, const EPixelFormat Format);
+ 
+ protected:
+ 	FString AssetName;
+=== FILE: Source/Reflection/Public/Importers/Types/Texture/TextureFormats.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Texture/TextureFormats.h b/Source/Reflection/Public/Importers/Types/Texture/TextureFormats.h
+deleted file mode 100644
+index cb10c93..0000000
+--- a/Source/Reflection/Public/Importers/Types/Texture/TextureFormats.h
++++ /dev/null
+@@ -1,41 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "Engine/Compatibility.h"
+-#include "Engine/Texture.h"
+-#include "PixelFormat.h"
+-
+-/* How a cooked pixel format unpacks into texture source data.
+- *
+- * BlockDim is 1 for uncompressed formats, where BytesPerBlock is simply the bytes per pixel.
+- * Block compressed pixels arrive as whole 4x4 blocks, and a volume holds one independent block
+- * image per slice, so both the sizes below and the decode itself work a slice at a time. */
+-struct FTextureSourceLayout {
+-	/* What the rebuilt source data ends up as */
+-	ETextureSourceFormat SourceFormat = TSF_BGRA8;
+-	int32 BytesPerVoxel = 4;
+-
+-	/* What arrives from Cloud */
+-	int32 BlockDim = 1;
+-	int32 BytesPerBlock = 4;
+-	bool RequiresDecode = false;
+-
+-	/* Bytes one slice takes up as it arrives */
+-	int64 GetEncodedSliceSize(int32 SizeX, int32 SizeY) const;
+-
+-	/* Bytes one slice takes up once decoded into texture source data */
+-	int64 GetDecodedSliceSize(int32 SizeX, int32 SizeY) const;
+-};
+-
+-struct REFLECTION_API FTextureFormats {
+-	/* Resolves an export's PixelFormat field, PF_Unknown when the name isn't a pixel format */
+-	static EPixelFormat FromName(const FString& Name);
+-
+-	/* False for formats with no source representation to rebuild from */
+-	static bool GetLayout(EPixelFormat Format, FTextureSourceLayout& OutLayout);
+-
+-	/* Decodes one slice worth of pixels into OutData, which has to hold GetDecodedSliceSize bytes.
+-	 * Not every format is covered, feel free to add if needed. Some may need other dependencies. */
+-	static void Decode(const uint8* Data, uint8* OutData, int32 SizeX, int32 SizeY, int64 DecodedSize, EPixelFormat Format);
+-};
+=== FILE: Source/Reflection/Public/Importers/Types/Texture/TextureImporter.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Texture/TextureImporter.h b/Source/Reflection/Public/Importers/Types/Texture/TextureImporter.h
+index be071e0..43de384 100644
+--- a/Source/Reflection/Public/Importers/Types/Texture/TextureImporter.h
++++ b/Source/Reflection/Public/Importers/Types/Texture/TextureImporter.h
+@@ -4,22 +4,9 @@
+ 
+ #include "Importers/Constructor/Importer.h"
+ 
+-/* Brings a texture over from Cloud.
+- *
+- * The export and the pixels come from the same endpoint: the export as json, the pixels as
+- * whatever encoding the class needs, picked by FTextureTypes. FTextureCreator turns the pair
+- * into an asset, this just does the fetching and the packaging around it. */
+-struct REFLECTION_API FTextureImport {
+-	/* Fetches an export and its pixels from Cloud, then builds the asset */
+-	static bool FromCloud(const FString& Path, const FString& FetchPath, UTexture*& OutTexture);
+-
+-	/* Builds the asset from an export and a payload already in hand */
+-	static bool FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture);
+-};
+-
+ /* Basic template importer using Asset Class. */
+ template <typename AssetType>
+ class ITextureImporter : public IImporter {
+ public:
+ 	virtual bool Import() override;
+-};
++};
+\ No newline at end of file
+=== FILE: Source/Reflection/Public/Importers/Types/Texture/TextureTypes.h ===
+diff --git a/Source/Reflection/Public/Importers/Types/Texture/TextureTypes.h b/Source/Reflection/Public/Importers/Types/Texture/TextureTypes.h
+deleted file mode 100644
+index 08ee1db..0000000
+--- a/Source/Reflection/Public/Importers/Types/Texture/TextureTypes.h
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-#include "Engine/Compatibility.h"
+-#include "Dom/JsonObject.h"
+-
+-/*The texture classes Reflection can rebuild from a Cloud export, and how their pixels travel.
+- *
+- * Cloud serves a texture one of two ways. An encoded image is the cheap path: it goes through
+- * UTextureFactory, which handles mips and compression on its own. It is also eight bit and two
+- * dimensional, so anything carrying more depth or precision than that has to ask for the raw
+- * bytes of the first mip instead and be rebuilt by hand. */
+-struct REFLECTION_API FTextureTypes {
+-	/* Every texture class with a creator behind it */
+-	static const TArray<FString>& All();
+-
+-	static bool IsSupported(const FString& Type);
+-
+-	/* Render targets are created empty, every other texture arrives with pixels */
+-	static bool HasPixelPayload(const FString& Type);
+-
+-	/* Whether the pixels have to come down as raw mip bytes rather than an encoded image */
+-	static bool RequiresRawMipData(const FString& Type, bool bIsVectorDisplacementMap);
+-
+-	/* Compression settings an encoded image can't carry, read straight off the export */
+-	static bool IsVectorDisplacementMap(const TSharedPtr<FJsonObject>& Export);
+-};
+=== FILE: Source/Reflection/Public/Modules/Toolbar/Tools/ImportFromPath.h ===
+diff --git a/Source/Reflection/Public/Modules/Toolbar/Tools/ImportFromPath.h b/Source/Reflection/Public/Modules/Toolbar/Tools/ImportFromPath.h
+deleted file mode 100644
+index f62e97a..0000000
+--- a/Source/Reflection/Public/Modules/Toolbar/Tools/ImportFromPath.h
++++ /dev/null
+@@ -1,20 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-#include "Modules/Tools/ToolBase.h"
+-
+-/* Reflects assets straight out of Cloud by path.
+- *
+- * Everything else in Reflection starts from something already in the project: a selected asset, a
+- * folder of json, a reference another import ran into. This one starts from the path alone, which
+- * is the only way to reach an asset nothing in the project points at yet. */
+-class TToolImportFromPath : public TToolBase {
+-public:
+-	void Execute();
+-
+-	/* Reflects one asset. The path can be in either Cloud or editor form, with or without an extension, an export name or a Type'...' wrapper around it.
+-	 * False when Cloud has nothing at that path, or the import itself failed. */
+-	static bool Import(const FString& InPath);
+-};
+=== FILE: Source/Reflection/Public/Modules/UI/SupportedAssets/SSupportedAssetsPanel.h ===
+diff --git a/Source/Reflection/Public/Modules/UI/SupportedAssets/SSupportedAssetsPanel.h b/Source/Reflection/Public/Modules/UI/SupportedAssets/SSupportedAssetsPanel.h
+deleted file mode 100644
+index d467c5f..0000000
+--- a/Source/Reflection/Public/Modules/UI/SupportedAssets/SSupportedAssetsPanel.h
++++ /dev/null
+@@ -1,65 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-#include "Widgets/SCompoundWidget.h"
+-#include "Widgets/Views/SListView.h"
+-
+-class SSearchBox;
+-
+-/* One asset type, as the list shows it */
+-struct FSupportedAssetEntry {
+-	/* The type as the registries name it, which is what a Cloud export carries */
+-	FString Type;
+-
+-	/* The same type without the GeneratedClass suffix. Nothing ships an icon for
+-	 * BlueprintGeneratedClass, and the class it was generated from reads better anyway. */
+-	FString DisplayType;
+-
+-	FString Category;
+-
+-	/* Which importer picks it up */
+-	FString Importer;
+-
+-	/* Hidden unless experiments are turned on in the settings */
+-	bool Experimental = false;
+-
+-	/* Reachable from a local json dump, but never fetched from Cloud */
+-	bool CloudBlocked = false;
+-};
+-
+-namespace SupportedAssetColumns {
+-	const FName Type(TEXT("Type"));
+-	const FName Category(TEXT("Category"));
+-	const FName Importer(TEXT("Importer"));
+-	const FName Notes(TEXT("Notes"));
+-}
+-
+-/* Lists every asset type Reflection can build, read out of the registries themselves rather than
+- * written down anywhere: the importer factory registry, the templated type table and the texture
+- * classes. A type missing from this window is a type nothing has claimed. */
+-class REFLECTION_API SSupportedAssetsPanel : public SCompoundWidget {
+-public:
+-	SLATE_BEGIN_ARGS(SSupportedAssetsPanel) {}
+-	SLATE_END_ARGS()
+-
+-	void Construct(const FArguments& InArgs);
+-
+-	/* Reads the registries again, ex: after experiments get toggled */
+-	void Refresh();
+-
+-private:
+-	TSharedRef<ITableRow> GenerateRow(TSharedPtr<FSupportedAssetEntry> Entry, const TSharedRef<STableViewBase>& OwnerTable);
+-
+-	void OnSearchChanged(const FText& Text);
+-	void ApplyFilter();
+-
+-	FText GetSummaryText() const;
+-
+-	TArray<TSharedPtr<FSupportedAssetEntry>> AllEntries;
+-	TArray<TSharedPtr<FSupportedAssetEntry>> VisibleEntries;
+-
+-	TSharedPtr<SListView<TSharedPtr<FSupportedAssetEntry>>> ListView;
+-	FString SearchText;
+-};
+=== FILE: Source/Reflection/Public/Modules/UI/SupportedAssets/SupportedAssetsTab.h ===
+diff --git a/Source/Reflection/Public/Modules/UI/SupportedAssets/SupportedAssetsTab.h b/Source/Reflection/Public/Modules/UI/SupportedAssets/SupportedAssetsTab.h
+deleted file mode 100644
+index 0b8e64a..0000000
+--- a/Source/Reflection/Public/Modules/UI/SupportedAssets/SupportedAssetsTab.h
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-
+-class SDockTab;
+-class FSpawnTabArgs;
+-class SSupportedAssetsPanel;
+-
+-/* The window listing every asset type Reflection can build */
+-class REFLECTION_API FSupportedAssetsTab {
+-public:
+-	static void Register();
+-	static void Unregister();
+-
+-	/* Opens the tab, reading the registries again on the way in */
+-	static void Open();
+-
+-	static const FName TabId;
+-
+-private:
+-	static TSharedRef<SDockTab> Spawn(const FSpawnTabArgs& Args);
+-
+-	static TWeakPtr<SSupportedAssetsPanel> ActivePanel;
+-};
+=== FILE: Source/Reflection/Public/Utilities/AssetPaths.h ===
+diff --git a/Source/Reflection/Public/Utilities/AssetPaths.h b/Source/Reflection/Public/Utilities/AssetPaths.h
+deleted file mode 100644
+index 0f8d94c..0000000
+--- a/Source/Reflection/Public/Utilities/AssetPaths.h
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/* Copyright Reflection Contributors 2024-2026 */
+-
+-#pragma once
+-
+-#include "CoreMinimal.h"
+-#include "Settings/ReflectionSettings.h"
+-#include "Settings/SettingsAccess.h"
+-
+-/* Turns a package path as Cloud knows it into the one the same asset takes in the editor. */
+-inline FString ToEditorPackagePath(const FString& InPath) {
+-	FString Path = InPath;
+-
+-	const UReflectionSettings* Settings = GetSettings();
+-
+-	if (!Settings->AssetSettings.ProjectName.IsEmpty()) {
+-		Path = Path.Replace(*(Settings->AssetSettings.ProjectName + "/Content/"), TEXT("/Game/"));
+-		Path = Path.Replace(*(Settings->AssetSettings.ProjectName + "/Plugins"), TEXT(""));
+-		Path = Path.Replace(TEXT("/Content/"), TEXT("/"));
+-	}
+-
+-	Path = Path.Replace(TEXT("Engine/Content"), TEXT("/Engine"));
+-
+-	if (!Path.StartsWith(TEXT("/"))) {
+-		Path = "/" + Path;
+-	}
+-
+-	FRRedirects::Redirect(Path);
+-
+-	return Path;
+-}
+=== FILE: Source/Reflection/Public/Utilities/Dialog.h ===
+diff --git a/Source/Reflection/Public/Utilities/Dialog.h b/Source/Reflection/Public/Utilities/Dialog.h
+index e743ed1..542cdb7 100644
+--- a/Source/Reflection/Public/Utilities/Dialog.h
++++ b/Source/Reflection/Public/Utilities/Dialog.h
+@@ -10,14 +10,6 @@
+ #include "DesktopPlatformModule.h"
+ #include "IDesktopPlatform.h"
+ 
+-#include "Framework/Application/SlateApplication.h"
+-#include "Widgets/SBoxPanel.h"
+-#include "Widgets/SWindow.h"
+-#include "Widgets/Input/SButton.h"
+-#include "Widgets/Input/SMultiLineEditableTextBox.h"
+-#include "Widgets/Layout/SBorder.h"
+-#include "Widgets/Text/STextBlock.h"
+-
+ #include "Engine/Compatibility.h"
+ 
+ /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
+@@ -47,89 +39,6 @@ inline auto SpawnYesNoPrompt = [](const FString& Title, const FString& Text, con
+ 	OnResponse(Response == EAppReturnType::Yes);
+ };
+ 
+-/*
+- * Asks the user for some text, seeded with whatever is already in InOutText.
+- *
+- * Multi line, because everything that needs typed input here takes a list. Returns false when the
+- * user cancels or leaves it empty, in which case InOutText is left alone.
+- */
+-inline bool SpawnTextEntryPrompt(const FString& Title, const FString& Hint, FString& InOutText) {
+-	bool Accepted = false;
+-
+-	TSharedPtr<SMultiLineEditableTextBox> TextBox;
+-
+-	const TSharedRef<SWindow> Window = SNew(SWindow)
+-		.Title(FText::FromString(Title))
+-		.ClientSize(FVector2D(640, 280))
+-		.SupportsMinimize(false)
+-		.SupportsMaximize(false);
+-
+-	Window->SetContent(
+-		SNew(SBorder)
+-		.Padding(12.0f)
+-		[
+-			SNew(SVerticalBox)
+-
+-			+ SVerticalBox::Slot()
+-			.AutoHeight()
+-			.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+-			[
+-				SNew(STextBlock)
+-				.Text(FText::FromString(Hint))
+-				.AutoWrapText(true)
+-			]
+-
+-			+ SVerticalBox::Slot()
+-			.FillHeight(1.0f)
+-			[
+-				SAssignNew(TextBox, SMultiLineEditableTextBox)
+-				.Text(FText::FromString(InOutText))
+-			]
+-
+-			+ SVerticalBox::Slot()
+-			.AutoHeight()
+-			.HAlign(HAlign_Right)
+-			.Padding(0.0f, 10.0f, 0.0f, 0.0f)
+-			[
+-				SNew(SHorizontalBox)
+-
+-				+ SHorizontalBox::Slot()
+-				.AutoWidth()
+-				.Padding(0.0f, 0.0f, 6.0f, 0.0f)
+-				[
+-					SNew(SButton)
+-					.Text(FText::FromString("Reflect"))
+-					.OnClicked_Lambda([&Accepted, &InOutText, &TextBox, Window]() {
+-						Accepted = true;
+-						InOutText = TextBox->GetText().ToString();
+-
+-						Window->RequestDestroyWindow();
+-
+-						return FReply::Handled();
+-					})
+-				]
+-
+-				+ SHorizontalBox::Slot()
+-				.AutoWidth()
+-				[
+-					SNew(SButton)
+-					.Text(FText::FromString("Cancel"))
+-					.OnClicked_Lambda([Window]() {
+-						Window->RequestDestroyWindow();
+-
+-						return FReply::Handled();
+-					})
+-				]
+-			]
+-		]
+-	);
+-
+-	const IMainFrameModule& MainFrameModule = IMainFrameModule::Get();
+-	FSlateApplication::Get().AddModalWindow(Window, MainFrameModule.GetParentWindow());
+-
+-	return Accepted && !InOutText.IsEmpty();
+-}
+-
+ /* Clipboard and file pickers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+ inline FString GetClipboard() {
+ 	FString ClipboardContent;
+=== FILE: Source/Reflection/Public/Utilities/JsonHelpers.h ===
+diff --git a/Source/Reflection/Public/Utilities/JsonHelpers.h b/Source/Reflection/Public/Utilities/JsonHelpers.h
+index 32a3f79..53251a5 100644
+--- a/Source/Reflection/Public/Utilities/JsonHelpers.h
++++ b/Source/Reflection/Public/Utilities/JsonHelpers.h
+@@ -278,15 +278,7 @@ inline FName GetExportNameOfSubobject(const FString& PackageIndex) {
+ 		PackageIndex.Split("'", nullptr, &Name);
+ 		Name.Split(":", nullptr, &Name);
+ 		Name = Name.Replace(TEXT("'"), TEXT(""));
+-
+-		/* Subobjects nest, and only the last segment names the export. A reroute living inside a
+-		 * composite's subgraph arrives as
+-		 * MaterialGraph_1.MaterialGraphNode_Composite_0.<Subgraph>.MaterialExpressionReroute_8,
+-		 * and stopping at the colon would hand back the whole chain. */
+-		if (Name.Contains(TEXT("."))) {
+-			Name.Split(TEXT("."), nullptr, &Name, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+-		}
+ 	}
+-
++	
+ 	return StringToName(Name);
+ }
+\ No newline at end of file
+=== FILE: Source/Reflection/Reflection.Build.cs ===
+diff --git a/Source/Reflection/Reflection.Build.cs b/Source/Reflection/Reflection.Build.cs
+index e808919..1ed102b 100644
+--- a/Source/Reflection/Reflection.Build.cs
++++ b/Source/Reflection/Reflection.Build.cs
+@@ -81,9 +81,6 @@ public class Reflection : ModuleRules {
+ 			/* FNodeFactory/SGraphNode, used to measure anim graph nodes when auto-laying them out */
+ 			"GraphEditor",
+ 
+-			/* UEdGraphSchema_K2, whose PC_* pin categories name the type of a blueprint variable */
+-			"BlueprintGraph",
+-
+ #if UE_4_23_OR_LATER
+ 			/* PhysicsCore was carved out of Engine in 4.23 */
+ 			"PhysicsCore",

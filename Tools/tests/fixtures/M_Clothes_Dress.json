@@ -1,0 +1,45 @@
+[
+  {
+    "Type": "Material",
+    "Name": "M_Clothes_Dress",
+    "Class": "Material",
+    "Package": "/Game/Characters/Clothes/M_Clothes_Dress",
+    "Properties": {
+      "BlendMode": "EBlendMode::BLEND_Masked",
+      "BaseColor": { "OutputIndex": 0, "InputName": "BaseColor" },
+      "OpacityMask": { "OutputIndex": 0, "InputName": "OpacityMask" },
+      "bUsedWithSkeletalMesh": true
+    },
+    "LoadedMaterialResources": [
+      {
+        "LoadedShaderMap": {
+          "Content": {
+            "MaterialCompilationOutput": {
+              "UniformExpressionSet": {
+                "UniformScalarExpressions": [
+                  { "Type": "UniformExpressionScalarParameter", "ParameterInfo": { "Name": "PatternScale", "Association": "GlobalParameter", "Index": 0 } }
+                ],
+                "UniformVectorExpressions": [
+                  { "Type": "UniformExpressionVectorParameter", "ParameterInfo": { "Name": "DressColor", "Association": "GlobalParameter", "Index": 0 } }
+                ],
+                "Uniform2DTextureExpressions": [
+                  { "Type": "UniformExpressionTextureParameter", "ParameterInfo": { "Name": "DressAlbedo", "Association": "GlobalParameter", "Index": 0 } }
+                ],
+                "ScalarParameterValues": [ 0.5 ],
+                "VectorParameterValues": [ { "R": 0.9, "G": 0.2, "B": 0.2, "A": 1.0 } ],
+                "TextureParameterValues": [
+                  { "ObjectName": "Texture2D '/Game/Textures/T_Dress.T_Dress'", "ObjectPath": "/Game/Textures/T_Dress.T_Dress" }
+                ],
+                "UniformBufferLayoutInitializer": { "Members": [], "Size": 32 }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "CachedExpressionData": {
+      "FunctionInfos": [],
+      "PropertyConnectedMask": 6
+    }
+  }
+]

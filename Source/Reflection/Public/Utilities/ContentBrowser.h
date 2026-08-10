@@ -1,0 +1,141 @@
+/* Copyright Reflection Contributors 2024-2026 */
+
+#pragma once
+
+#include "IContentBrowserSingleton.h"
+#include "ContentBrowserModule.h"
+#include "Utilities/Dialog.h"
+#include "Engine/Compatibility.h"
+
+/* AssetRegistryModule.h only moved under an AssetRegistry/ folder later on */
+#if UE4_25_BELOW
+#include "AssetRegistryModule.h"
+#else
+#include "AssetRegistry/AssetRegistryModule.h"
+#endif
+#include "Engine/Log.h"
+
+inline void BrowseToAsset(UObject* Asset) {
+	/* Browse to newly added Asset in the Content Browser */
+	const TArray<FAssetData>& Assets = { Asset };
+	const FContentBrowserModule& ContentBrowserModule = FModuleManager::Get().LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+	ContentBrowserModule.Get().SyncBrowserToAssets(Assets);
+}
+
+/* Get the asset currently selected in the Content Browser. */
+template <typename T>
+T* GetSelectedAsset(const bool SuppressErrors = false, FString OptionalAssetNameCheck = "") {
+	const FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+	TArray<FAssetData> SelectedAssets;
+	ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
+
+	if (SelectedAssets.Num() == 0) {
+		if (SuppressErrors == true) {
+			return nullptr;
+		}
+		
+		GLog->Log("Reflection: [GetSelectedAsset] None selected, returning nullptr.");
+
+		const FText DialogText = FText::Format(
+			FText::FromString(TEXT("Reflecting an asset of type '{0}' requires a base asset selected to modify. Select one in your content browser.")),
+			FText::FromString(T::StaticClass()->GetName())
+		);
+
+		FMessageDialog::Open(EAppMsgType::Ok, DialogText);
+		
+		return nullptr;
+	}
+
+	UObject* SelectedAsset = SelectedAssets[0].GetAsset();
+	T* CastedAsset = Cast<T>(SelectedAsset);
+
+	if (!CastedAsset) {
+		if (SuppressErrors == true) {
+			return nullptr;
+		}
+		
+		GLog->Log("Reflection: [GetSelectedAsset] Selected asset is not of the required class, returning nullptr.");
+
+		const FText DialogText = FText::Format(
+			FText::FromString(TEXT("The selected asset is not of type '{0}'. Please select a valid asset.")),
+			FText::FromString(T::StaticClass()->GetName())
+		);
+
+		FMessageDialog::Open(EAppMsgType::Ok, DialogText);
+		
+		return nullptr;
+	}
+
+	if (CastedAsset && OptionalAssetNameCheck != "" && !CastedAsset->GetName().Equals(OptionalAssetNameCheck)) {
+		CastedAsset = nullptr;
+	}
+
+	return CastedAsset;
+}
+
+/* Package path of the folder selected in the Content Browser, empty when nothing is selected.
+ * Ex: "/Game/Characters/Items" */
+inline FString GetSelectedContentBrowserFolder() {
+	const FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+
+	TArray<FString> SelectedFolders;
+	ContentBrowserModule.Get().GetSelectedPathViewFolders(SelectedFolders);
+
+	if (SelectedFolders.Num() == 0) {
+		return FString();
+	}
+
+#if ENGINE_UE5
+	/* Convert virtual paths to internal package paths */
+	const UContentBrowserDataSubsystem* ContentBrowserData = GEditor->GetEditorSubsystem<UContentBrowserDataSubsystem>();
+
+	if (!ContentBrowserData) {
+		return FString();
+	}
+
+	const TArray<FString> InternalPaths = ContentBrowserData->TryConvertVirtualPathsToInternal(SelectedFolders);
+
+	return InternalPaths.Num() > 0 ? InternalPaths[0] : FString();
+#else
+	return SelectedFolders[0];
+#endif
+}
+
+/* Gets all assets in selected folder */
+inline TArray<FAssetData> GetAssetsInSelectedFolder() {
+	TArray<FAssetData> AssetDataList;
+
+	const FString CurrentFolder = GetSelectedContentBrowserFolder();
+
+	if (CurrentFolder.IsEmpty()) {
+		UE_LOG(LogReflection, Warning, TEXT("No folder selected in the Content Browser."));
+		return AssetDataList;
+	}
+
+	/* Check if the folder is the root folder, and show a prompt if */
+	if (CurrentFolder == "/All/Game") {
+		bool Continue = false;
+		
+		SpawnYesNoPrompt(
+			TEXT("Large Operation"),
+			TEXT("This will stall the editor for a long time. Continue anyway?"),
+			[&](const bool Confirmed) {
+				Continue = Confirmed;
+			}
+		);
+
+		if (!Continue) {
+			UE_LOG(LogReflection, Warning, TEXT("Action cancelled by user."));
+			return AssetDataList;
+		}
+	}
+
+	/* Get the Asset Registry Module */
+	const FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	AssetRegistryModule.Get().SearchAllAssets(true);
+
+	/* Get all assets in the folder and its subfolders */
+	AssetRegistryModule.Get().GetAssetsByPath(FName(*CurrentFolder), AssetDataList, true);
+
+	return AssetDataList;
+}
