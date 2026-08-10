@@ -1397,7 +1397,18 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		if (!Node) return Result;
 		for (URigVMPin* Pin : Node->GetPins()) {
 			if (Pin && !Pin->GetCPPType().Contains(TEXT("Execute"))) {
-				Result.Add(Pin);
+				if (Pin->IsArray()) {
+					TArray<URigVMPin*> SubPins = Pin->GetSubPins();
+					if (SubPins.Num() > 0) {
+						for (URigVMPin* Sub : SubPins) {
+							if (Sub) Result.Add(Sub);
+						}
+					} else {
+						Result.Add(Pin);
+					}
+				} else {
+					Result.Add(Pin);
+				}
 			}
 		}
 		return Result;
@@ -1630,6 +1641,9 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 	int32 DataLinksCreated = 0;
 
 	auto TryLinkPins = [&](URigVMNode* SrcNode, URigVMPin* SrcPin, URigVMNode* DstNode, URigVMPin* DstPin) -> bool {
+		if (!SrcPin || !DstPin) return false;
+		if (SrcNode == DstNode && SrcPin == DstPin) return false;
+
 		FString FailureReason;
 		if (Controller->AddLink(SrcPin, DstPin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
 			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked data %s.%s -> %s.%s"),
@@ -1798,37 +1812,20 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Graph created with %d nodes, %d data links, %d var links for '%s'"), NodesCreated, DataLinksCreated, ExtLinksCreated, *InControlRigBlueprint->GetName());
 
-	/* Phase 5: Resolve wildcard pins on dispatch template nodes using connected source types */
+	/* Phase 5: Resolve any remaining dispatch template nodes with wildcard pins */
 	int32 TemplatesResolved = 0;
 	int32 WildcardsResolved = 0;
-
-	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 scanning %d created nodes"), CreatedNodes.Num());
 	for (const FCreatedNodeInfo& Info : CreatedNodes) {
 		URigVMTemplateNode* TNode = Cast<URigVMTemplateNode>(Info.Node);
-		if (!TNode) {
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 skip '%s' - not a template node"), *Info.Node->GetName());
-			continue;
-		}
-		if (!TNode->HasWildCardPin()) {
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 skip '%s' - no wildcard pins"), *TNode->GetName());
-			continue;
-		}
+		if (!TNode) continue;
+		if (!TNode->HasWildCardPin()) continue;
 
 		const FRigVMTemplate* Templ = TNode->GetTemplate();
-		if (!Templ) {
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 skip '%s' - no template"), *TNode->GetName());
-			continue;
-		}
-		if (!Templ->GetDispatchFactory()) {
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 skip '%s' - no dispatch factory"), *TNode->GetName());
-			continue;
-		}
-
-		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Resolving dispatch '%s' with %d pins"), *TNode->GetName(), TNode->GetPins().Num());
+		if (!Templ) continue;
+		if (!Templ->GetDispatchFactory()) continue;
 
 		bool bResolvedSomething = false;
 
-		/* Resolve each wildcard input pin that has a connected source */
 		TArray<FString> WildcardPinNames;
 		for (URigVMPin* Pin : TNode->GetPins()) {
 			if (Pin && Pin->IsWildCard() && Pin->GetDirection() == ERigVMPinDirection::Input) {
@@ -1851,17 +1848,11 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			if (Controller->ResolveWildCardPin(Pin, SourceType, false, false)) {
 				WildcardsResolved++;
 				bResolvedSomething = true;
-				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Resolved wildcard '%s' on '%s'"),
-					*PinName, *TNode->GetName());
-				break; /* UpdateTemplateNodePinTypes should resolve all pins */
+				break;
 			}
 		}
 
 		TemplatesResolved++;
-		const FRigVMFunction* ResFunc = TNode->GetResolvedFunction();
-		FString FuncName = ResFunc ? ResFunc->GetName() : TEXT("null");
-		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Dispatch '%s' resolved=%d func=%s"),
-			*TNode->GetName(), TNode->IsResolved() ? 1 : 0, *FuncName);
 	}
 	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 complete -- %d dispatch nodes, %d wildcards resolved"), TemplatesResolved, WildcardsResolved);
 #endif
