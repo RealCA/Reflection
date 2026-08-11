@@ -1186,6 +1186,169 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		}
 
 		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.1 complete -- %d Branch links created"), BranchFixes);
+
+		/* Phase 1.2: Fix For_Each/ArrayIterator dispatch exec routing.
+		   For_Each has ExecuteContext (IO pin, serves as both loop body output and input)
+		   and Completed (output exec, fires after loop finishes).
+		   BranchInfos map: ExecuteContext label = loop body range, Completed label = post-loop.
+		   Current linear chain connects For_Each.Completed to the first loop body node,
+		   which causes Index=Count (out of bounds) when the loop finishes. */
+		{
+			int32 DispatchFixes = 0;
+
+			auto FindFirstExecInRange = [&](int32 FirstIdx, int32 LastIdx) -> URigVMNode* {
+				URigVMNode* BestNode = nullptr;
+				int32 BestDist = MAX_int32;
+				for (const FCreatedNodeInfo& CI : CreatedNodes) {
+					if (CI.InstructionIndex < FirstIdx || CI.InstructionIndex > LastIdx) continue;
+					URigVMNode* N = CI.Node;
+					if (!N) continue;
+					bool bHasExecPin = false;
+					for (URigVMPin* P : N->GetPins()) {
+						if (P && P->GetCPPType().Contains(TEXT("Execute"))) {
+							bHasExecPin = true;
+							break;
+						}
+					}
+					if (!bHasExecPin) continue;
+					int32 Dist = CI.InstructionIndex - FirstIdx;
+					if (Dist < BestDist) {
+						BestDist = Dist;
+						BestNode = N;
+					}
+				}
+				return BestNode;
+			};
+
+			auto FindFirstExecAfter = [&](int32 AfterIdx) -> URigVMNode* {
+				URigVMNode* BestNode = nullptr;
+				int32 BestDist = MAX_int32;
+				for (const FCreatedNodeInfo& CI : CreatedNodes) {
+					if (CI.InstructionIndex <= AfterIdx) continue;
+					URigVMNode* N = CI.Node;
+					if (!N) continue;
+					bool bHasExecPin = false;
+					for (URigVMPin* P : N->GetPins()) {
+						if (P && P->GetCPPType().Contains(TEXT("Execute"))) {
+							bHasExecPin = true;
+							break;
+						}
+					}
+					if (!bHasExecPin) continue;
+					int32 Dist = CI.InstructionIndex - AfterIdx;
+					if (Dist < BestDist) {
+						BestDist = Dist;
+						BestNode = N;
+					}
+				}
+				return BestNode;
+			};
+
+			auto GetExecInputPin = [](URigVMNode* Node) -> URigVMPin* {
+				if (!Node) return nullptr;
+				for (URigVMPin* P : Node->GetPins()) {
+					if (P && P->GetCPPType().Contains(TEXT("Execute")) &&
+						(P->GetDirection() == ERigVMPinDirection::Input || P->GetDirection() == ERigVMPinDirection::IO)) {
+						return P;
+					}
+				}
+				return nullptr;
+			};
+
+			auto BreakExistingLinks = [&](URigVMPin* Pin) {
+				if (!Pin) return;
+				TArray<URigVMLink*> Links = Pin->GetSourceLinks();
+				for (URigVMLink* Link : Links) {
+					if (Link) {
+						URigVMPin* Src = Link->GetSourcePin();
+						if (Src) Controller->BreakLink(Src, Pin);
+					}
+				}
+				TArray<URigVMLink*> TargetLinks = Pin->GetTargetLinks();
+				for (URigVMLink* Link : TargetLinks) {
+					if (Link) {
+						URigVMPin* Dst = Link->GetTargetPin();
+						if (Dst) Controller->BreakLink(Pin, Dst);
+					}
+				}
+			};
+
+			for (const FBranchInfo& BI : BranchInfos) {
+				if (BI.Label != TEXT("ExecuteContext")) continue;
+
+				int32 BranchIfFalseIdx = BI.InstructionIndex;
+				int32 DispatchIdx = BranchIfFalseIdx - 1;
+
+				URigVMNode** DispatchNodePtr = nullptr;
+				for (const FCreatedNodeInfo& CI : CreatedNodes) {
+					if (CI.InstructionIndex == DispatchIdx && CI.Node) {
+						DispatchNodePtr = const_cast<URigVMNode**>(&CI.Node);
+						break;
+					}
+				}
+				if (!DispatchNodePtr || !(*DispatchNodePtr)) continue;
+
+				URigVMNode* DispatchNode = *DispatchNodePtr;
+
+				URigVMPin* ExecuteContextPin = nullptr;
+				URigVMPin* CompletedPin = nullptr;
+				for (URigVMPin* Pin : DispatchNode->GetPins()) {
+					if (!Pin || !Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+					if (Pin->GetName() == TEXT("ExecuteContext")) ExecuteContextPin = Pin;
+					else if (Pin->GetName() == TEXT("Completed")) CompletedPin = Pin;
+				}
+				if (!ExecuteContextPin || !CompletedPin) continue;
+
+				const FBranchInfo* CompletedBI = nullptr;
+				for (const FBranchInfo& BI2 : BranchInfos) {
+					if (BI2.InstructionIndex == BranchIfFalseIdx && BI2.Label == TEXT("Completed")) {
+						CompletedBI = &BI2;
+						break;
+					}
+				}
+
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Fixing For_Each dispatch '%s' at instruction %d"),
+					*DispatchNode->GetName(), DispatchIdx);
+
+				URigVMNode* LoopBodyNode = FindFirstExecInRange(BI.FirstInstruction, BI.LastInstruction);
+				if (LoopBodyNode) {
+					URigVMPin* LoopBodyInput = GetExecInputPin(LoopBodyNode);
+					if (LoopBodyInput) {
+						BreakExistingLinks(LoopBodyInput);
+
+						FString FailureReason;
+						if (Controller->AddLink(ExecuteContextPin, LoopBodyInput, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
+							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked For_Each ExecuteContext -> %s (loop body)"),
+								*LoopBodyNode->GetName());
+							DispatchFixes++;
+						} else {
+							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: For_Each ExecuteContext link failed -> %s: %s"),
+								*LoopBodyNode->GetName(), *FailureReason);
+						}
+					}
+				}
+
+				URigVMNode* PostLoopNode = FindFirstExecAfter(BI.LastInstruction);
+				if (PostLoopNode) {
+					URigVMPin* PostLoopInput = GetExecInputPin(PostLoopNode);
+					if (PostLoopInput) {
+						BreakExistingLinks(PostLoopInput);
+
+						FString FailureReason;
+						if (Controller->AddLink(CompletedPin, PostLoopInput, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
+							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked For_Each Completed -> %s (post-loop)"),
+								*PostLoopNode->GetName());
+							DispatchFixes++;
+						} else {
+							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: For_Each Completed link failed -> %s: %s"),
+								*PostLoopNode->GetName(), *FailureReason);
+						}
+					}
+				}
+			}
+
+			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.2 complete -- %d For_Each dispatch links fixed"), DispatchFixes);
+		}
 	}
 
 	/* Phase 1.5: Set pin defaults from LiteralMemory constants */
@@ -1245,6 +1408,18 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				if (!DestPin) continue;
 
 				if (DestPin->GetCPPType() == TEXT("FRigElementKey")) {
+					auto RigElemTypeName = [](int32 TypeValue) -> FString {
+						switch (TypeValue) {
+						case 0x001: return TEXT("Bone");
+						case 0x002: return TEXT("Null");
+						case 0x004: return TEXT("Control");
+						case 0x008: return TEXT("Curve");
+						case 0x020: return TEXT("Reference");
+						case 0x040: return TEXT("Connector");
+						case 0x080: return TEXT("Socket");
+						default: return FString::FromInt(TypeValue);
+						}
+					};
 					TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
 					for (URigVMPin* SubPin : SubPins) {
 						if (SubPin && SubPin->GetName() == TEXT("Type")) {
@@ -1253,7 +1428,7 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 								TypeStart += 5;
 								int32 TypeEnd = DefaultValue.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, TypeStart);
 								if (TypeEnd != INDEX_NONE) {
-									FString TypeStr = DefaultValue.Mid(TypeStart, TypeEnd - TypeStart);
+									FString TypeStr = RigElemTypeName(FCString::Atoi(*DefaultValue.Mid(TypeStart, TypeEnd - TypeStart)));
 									FString PinPath = SubPin->GetPinPath();
 									Controller->SetPinDefaultValue(PinPath, TypeStr, false, false);
 								}
@@ -1341,6 +1516,18 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				if (!DestPin) continue;
 
 				if (DestPin->GetCPPType() == TEXT("FRigElementKey")) {
+					auto RigElemTypeName = [](int32 TypeValue) -> FString {
+						switch (TypeValue) {
+						case 0x001: return TEXT("Bone");
+						case 0x002: return TEXT("Null");
+						case 0x004: return TEXT("Control");
+						case 0x008: return TEXT("Curve");
+						case 0x020: return TEXT("Reference");
+						case 0x040: return TEXT("Connector");
+						case 0x080: return TEXT("Socket");
+						default: return FString::FromInt(TypeValue);
+						}
+					};
 					TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
 					for (URigVMPin* SubPin : SubPins) {
 						if (SubPin && SubPin->GetName() == TEXT("Type")) {
@@ -1349,7 +1536,7 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 								TypeStart += 5;
 								int32 TypeEnd = DefaultValue.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, TypeStart);
 								if (TypeEnd != INDEX_NONE) {
-									FString TypeStr = DefaultValue.Mid(TypeStart, TypeEnd - TypeStart);
+									FString TypeStr = RigElemTypeName(FCString::Atoi(*DefaultValue.Mid(TypeStart, TypeEnd - TypeStart)));
 									FString PinPath = SubPin->GetPinPath();
 									Controller->SetPinDefaultValue(PinPath, TypeStr, false, false);
 								}
