@@ -804,7 +804,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 	float PosX = 0.0f;
 	float PosY = 0.0f;
 	int32 NodesCreated = 0;
-	URigVMNode* PrevExecNode = nullptr;
 
 	for (int32 i = 0; i < InstructionsArray->Num(); ++i) {
 		const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[i]->AsObject();
@@ -830,9 +829,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 		bool bIsEntry = (TypeName == TEXT("FRigUnit_BeginExecution") || TypeName == TEXT("FRigUnit_InverseExecution") || TypeName == TEXT("FRigUnit_PrepareForExecution"));
 		bool bIsBranch = TypeName.Contains(TEXT("ControlFlowBranch"));
-		if (bIsEntry) {
-			PrevExecNode = nullptr;
-		}
 
 		URigVMNode* NewNode = nullptr;
 
@@ -953,59 +949,10 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 		if (NewNode) {
 			TArray<URigVMPin*> NewPins = NewNode->GetPins();
-			URigVMPin* NewExecInputPin = nullptr;
-			URigVMPin* NewExecOutputPin = nullptr;
-
 			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Node '%s' pins:"), *NewNode->GetName());
 			for (URigVMPin* Pin : NewPins) {
 				if (!Pin) continue;
 				UE_LOG(LogTemp, Log, TEXT("  Pin '%s' CPPType='%s' Dir=%d"), *Pin->GetName(), *Pin->GetCPPType(), (int32)Pin->GetDirection());
-				if (Pin->GetCPPType().Contains(TEXT("Execute"))) {
-					ERigVMPinDirection Dir = Pin->GetDirection();
-					if ((Dir == ERigVMPinDirection::Input || Dir == ERigVMPinDirection::IO) && !NewExecInputPin) {
-						NewExecInputPin = Pin;
-					}
-					if ((Dir == ERigVMPinDirection::Output || Dir == ERigVMPinDirection::IO) && !NewExecOutputPin) {
-						NewExecOutputPin = Pin;
-					}
-				}
-			}
-
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: PrevExecNode=%s NewExecInputPin=%s NewExecOutputPin=%s"),
-				PrevExecNode ? *PrevExecNode->GetName() : TEXT("null"),
-				NewExecInputPin ? *NewExecInputPin->GetName() : TEXT("null"),
-				NewExecOutputPin ? *NewExecOutputPin->GetName() : TEXT("null"));
-
-			if (PrevExecNode && NewExecInputPin) {
-				TArray<URigVMPin*> PrevPins = PrevExecNode->GetPins();
-				URigVMPin* PrevExecPin = nullptr;
-
-				URigVMPin* CompletedPin = nullptr;
-				URigVMPin* FirstOutputExecPin = nullptr;
-				for (URigVMPin* Pin : PrevPins) {
-					if (Pin && Pin->GetCPPType().Contains(TEXT("Execute")) && Pin->GetDirection() != ERigVMPinDirection::Input) {
-						if (!FirstOutputExecPin) FirstOutputExecPin = Pin;
-						if (Pin->GetName() == TEXT("Completed")) {
-							CompletedPin = Pin;
-							break;
-						}
-					}
-				}
-				PrevExecPin = CompletedPin ? CompletedPin : FirstOutputExecPin;
-				if (PrevExecPin && PrevExecPin != NewExecInputPin) {
-					FString FailureReason;
-					if (Controller->AddLink(PrevExecPin, NewExecInputPin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
-						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked exec %s -> %s"), *PrevExecNode->GetNodePath(), *NewNode->GetNodePath());
-					} else {
-						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Exec link failed %s -> %s: %s"), *PrevExecNode->GetNodePath(), *NewNode->GetNodePath(), *FailureReason);
-					}
-				}
-			}
-
-			if ((NewExecOutputPin || NewExecInputPin) && !bIsBranch) {
-				PrevExecNode = NewNode;
-			} else if (bIsBranch) {
-				PrevExecNode = nullptr;
 			}
 
 			FCreatedNodeInfo Info;
@@ -1030,7 +977,155 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1 complete -- %d nodes created for '%s'"), NodesCreated, *InControlRigBlueprint->GetName());
 
-	/* Phase 1.1: Fix Branch exec routing using BranchInfos */
+	auto GetNonExecPins = [](URigVMNode* Node) -> TArray<URigVMPin*> {
+		TArray<URigVMPin*> Result;
+		if (!Node) return Result;
+		for (URigVMPin* Pin : Node->GetPins()) {
+			if (!Pin || Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+			if (Pin->IsArray()) {
+				TArray<URigVMPin*> SubPins = Pin->GetSubPins();
+				if (SubPins.Num() > 0) {
+					for (URigVMPin* Sub : SubPins) {
+						if (Sub) Result.Add(Sub);
+					}
+				} else {
+					Result.Add(Pin);
+				}
+			} else {
+				Result.Add(Pin);
+			}
+		}
+		return Result;
+	};
+
+	/* Phase 1.7: Create variable getter/setter nodes for ALL referenced external variables.
+	   First pass: classify each external var as read (getter), write (setter), or both.
+	   Second pass: create the appropriate nodes. */
+	int32 VarNodesCreated = 0;
+	float ExtPosY = PosY + 300.0f;
+
+	{
+		/* Classify: for each external reg, track if it's read and/or written */
+		struct FExtVarUsage {
+			bool bRead = false;
+			bool bWritten = false;
+		};
+		TMap<int32, FExtVarUsage> ExtVarUsageMap;
+
+		for (int32 i = 0; i < InstructionsArray->Num(); ++i) {
+			const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[i]->AsObject();
+			if (!InstrObj.IsValid()) continue;
+
+			int32 OpCode = 0;
+			InstrObj->TryGetNumberField(TEXT("OpCode"), OpCode);
+
+			if (OpCode == 101) {
+				/* OpCode 101: Arguments list, paired with node's data pins */
+				URigVMNode* Node = nullptr;
+				for (const FCreatedNodeInfo& CI : CreatedNodes) {
+					if (CI.InstructionIndex == i) { Node = CI.Node; break; }
+				}
+				if (!Node) continue;
+
+				TArray<URigVMPin*> DataPins = GetNonExecPins(Node);
+
+				const TArray<TSharedPtr<FJsonValue>>* ArgsArray = nullptr;
+				InstrObj->TryGetArrayField(TEXT("Arguments"), ArgsArray);
+				if (!ArgsArray) continue;
+
+				for (int32 a = 0; a < ArgsArray->Num(); ++a) {
+					const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
+					if (!ArgObj.IsValid()) continue;
+
+					int32 MemType = 0, RegIdx = 0;
+					ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
+					ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+					if (MemType != 2) continue;
+					if (RegIdx < 0 || RegIdx >= ExternalVariables.Num()) continue;
+
+					/* Determine direction: if pin at this arg index is Input -> getter; if Output/IO -> setter */
+					bool bIsInput = true;
+					if (a < DataPins.Num() && DataPins[a]) {
+						ERigVMPinDirection Dir = DataPins[a]->GetDirection();
+						bIsInput = (Dir == ERigVMPinDirection::Input);
+					}
+
+					FExtVarUsage& Usage = ExtVarUsageMap.FindOrAdd(RegIdx);
+					if (bIsInput) Usage.bRead = true;
+					else Usage.bWritten = true;
+				}
+			}
+			else if (OpCode == 68) {
+				/* Copy(68): Source is read, Target is written */
+				auto ClassifyCopyRef = [&](const TCHAR* FieldName, bool bRead) {
+					const TSharedPtr<FJsonObject>* FieldObj = nullptr;
+					if (!InstrObj->TryGetObjectField(FieldName, FieldObj)) return;
+					int32 MemType = 0, RegIdx = 0;
+					(*FieldObj)->TryGetNumberField(TEXT("MemoryType"), MemType);
+					(*FieldObj)->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+					if (MemType != 2) return;
+					if (RegIdx < 0 || RegIdx >= ExternalVariables.Num()) return;
+					FExtVarUsage& Usage = ExtVarUsageMap.FindOrAdd(RegIdx);
+					if (bRead) Usage.bRead = true;
+					else Usage.bWritten = true;
+				};
+				ClassifyCopyRef(TEXT("Source"), true);
+				ClassifyCopyRef(TEXT("Target"), false);
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: External variable usage: %d referenced"), ExtVarUsageMap.Num());
+
+		/* Second pass: create getter and/or setter nodes for each referenced external var */
+		for (const auto& Pair : ExtVarUsageMap) {
+			int32 RegIdx = Pair.Key;
+			const FExtVarUsage& Usage = Pair.Value;
+			if (RegIdx < 0 || RegIdx >= ExternalVariables.Num()) continue;
+
+			const FExternalVariable& Var = ExternalVariables[RegIdx];
+			UStruct* CPPTypeObject = nullptr;
+			if (Var.CPPType != TEXT("double") && Var.CPPType != TEXT("float") && Var.CPPType != TEXT("bool") && Var.CPPType != TEXT("int32") && Var.CPPType != TEXT("int64")) {
+				CPPTypeObject = FindFirstObject<UStruct>(*Var.CPPType, EFindFirstObjectOptions::NativeFirst);
+			}
+
+			/* Create getter if variable is read */
+			if (Usage.bRead) {
+				URigVMVariableNode* GetterNode = Controller->AddVariableNode(
+					FName(*Var.Name), Var.CPPType, CPPTypeObject, true, Var.DefaultValue,
+					FVector2D(0.0f, ExtPosY), FString(), false, false
+				);
+				if (GetterNode) {
+					ExternalVarNodes.Add(RegIdx, GetterNode);
+					ExtPosY += 200.0f;
+					VarNodesCreated++;
+					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Created variable GETTER '%s' (type='%s') for Reg[%d]"), *Var.Name, *Var.CPPType, RegIdx);
+				} else {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Failed to create variable getter '%s' for Reg[%d]"), *Var.Name, RegIdx);
+				}
+			}
+
+			/* Create setter if variable is written (separate node) */
+			if (Usage.bWritten) {
+				FString SetterKey = FString::Printf(TEXT("Setter_%d"), RegIdx);
+				URigVMVariableNode* SetterNode = Controller->AddVariableNode(
+					FName(*Var.Name), Var.CPPType, CPPTypeObject, false, Var.DefaultValue,
+					FVector2D(300.0f, ExtPosY), FString(), false, false
+				);
+				if (SetterNode) {
+					ExternalVarNodes.Add(-RegIdx - 1, SetterNode);
+					ExtPosY += 200.0f;
+					VarNodesCreated++;
+					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Created variable SETTER '%s' (type='%s') for Reg[%d]"), *Var.Name, *Var.CPPType, RegIdx);
+				} else {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Failed to create variable setter '%s' for Reg[%d]"), *Var.Name, RegIdx);
+				}
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.7 complete -- %d variable getter/setter nodes created"), VarNodesCreated);
+	}
+
+	/* Phase 1.1: Branch exec routing using BranchInfos (runs first — no links exist yet). */
 	if (BranchInfos.Num() > 0) {
 		int32 BranchFixes = 0;
 
@@ -1058,7 +1153,7 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 			if (!BranchTruePin || !BranchFalsePin || !BranchCompletedPin) continue;
 
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Found Branch node '%s' -- fixing exec routing"), *Node->GetName());
+			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Found Branch node '%s' -- setting exec routing"), *Node->GetName());
 
 			auto FindAllExecNodesInRange = [&](int32 FirstIdx, int32 LastIdx) -> TArray<URigVMNode*> {
 				TArray<URigVMNode*> Result;
@@ -1105,16 +1200,16 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				return BestNode;
 			};
 
-			auto FindBranchInfo = [&](const FString& Label) -> const FBranchInfo* {
+			auto FindBranchInfo = [&](const FString& Label, int32 NodeInstrIdx) -> const FBranchInfo* {
 				for (const FBranchInfo& BI : BranchInfos) {
-					if (BI.Label == Label) return &BI;
+					if (BI.Label == Label && BI.InstructionIndex == NodeInstrIdx + 1) return &BI;
 				}
 				return nullptr;
 			};
 
-			const FBranchInfo* TrueBI = FindBranchInfo(TEXT("True"));
-			const FBranchInfo* FalseBI = FindBranchInfo(TEXT("False"));
-			const FBranchInfo* CompletedBI = FindBranchInfo(TEXT("Completed"));
+			const FBranchInfo* TrueBI = FindBranchInfo(TEXT("True"), Info.InstructionIndex);
+			const FBranchInfo* FalseBI = FindBranchInfo(TEXT("False"), Info.InstructionIndex);
+			const FBranchInfo* CompletedBI = FindBranchInfo(TEXT("Completed"), Info.InstructionIndex);
 
 			TArray<URigVMNode*> CompletedExecNodes;
 			if (CompletedBI) {
@@ -1160,16 +1255,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 				if (ConnectedExecInputs.Contains(TargetExecInput)) return;
 
-				TArray<URigVMLink*> SourceLinks = TargetExecInput->GetSourceLinks();
-				for (URigVMLink* Link : SourceLinks) {
-					if (Link) {
-						URigVMPin* SrcPin = Link->GetSourcePin();
-						if (SrcPin) {
-							Controller->BreakLink(SrcPin, TargetExecInput);
-						}
-					}
-				}
-
 				FString FailureReason;
 				if (Controller->AddLink(OutputPin, TargetExecInput, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
 					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked Branch %s -> %s"), Label, *TargetNode->GetName());
@@ -1187,12 +1272,9 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.1 complete -- %d Branch links created"), BranchFixes);
 
-		/* Phase 1.2: Fix For_Each/ArrayIterator dispatch exec routing.
-		   For_Each has ExecuteContext (IO pin, serves as both loop body output and input)
-		   and Completed (output exec, fires after loop finishes).
-		   BranchInfos map: ExecuteContext label = loop body range, Completed label = post-loop.
-		   Current linear chain connects For_Each.Completed to the first loop body node,
-		   which causes Index=Count (out of bounds) when the loop finishes. */
+		/* Phase 1.2: For_Each/ArrayIterator dispatch exec routing (runs second).
+		   For_Each has ExecuteContext (IO pin, loop body output+input) and Completed (output exec).
+		   BranchInfos map: ExecuteContext label = loop body range, Completed label = post-loop. */
 		{
 			int32 DispatchFixes = 0;
 
@@ -1255,24 +1337,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				return nullptr;
 			};
 
-			auto BreakExistingLinks = [&](URigVMPin* Pin) {
-				if (!Pin) return;
-				TArray<URigVMLink*> Links = Pin->GetSourceLinks();
-				for (URigVMLink* Link : Links) {
-					if (Link) {
-						URigVMPin* Src = Link->GetSourcePin();
-						if (Src) Controller->BreakLink(Src, Pin);
-					}
-				}
-				TArray<URigVMLink*> TargetLinks = Pin->GetTargetLinks();
-				for (URigVMLink* Link : TargetLinks) {
-					if (Link) {
-						URigVMPin* Dst = Link->GetTargetPin();
-						if (Dst) Controller->BreakLink(Pin, Dst);
-					}
-				}
-			};
-
 			for (const FBranchInfo& BI : BranchInfos) {
 				if (BI.Label != TEXT("ExecuteContext")) continue;
 
@@ -1299,23 +1363,13 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 				if (!ExecuteContextPin || !CompletedPin) continue;
 
-				const FBranchInfo* CompletedBI = nullptr;
-				for (const FBranchInfo& BI2 : BranchInfos) {
-					if (BI2.InstructionIndex == BranchIfFalseIdx && BI2.Label == TEXT("Completed")) {
-						CompletedBI = &BI2;
-						break;
-					}
-				}
-
-				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Fixing For_Each dispatch '%s' at instruction %d"),
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Setting For_Each dispatch '%s' at instruction %d"),
 					*DispatchNode->GetName(), DispatchIdx);
 
 				URigVMNode* LoopBodyNode = FindFirstExecInRange(BI.FirstInstruction, BI.LastInstruction);
 				if (LoopBodyNode) {
 					URigVMPin* LoopBodyInput = GetExecInputPin(LoopBodyNode);
 					if (LoopBodyInput) {
-						BreakExistingLinks(LoopBodyInput);
-
 						FString FailureReason;
 						if (Controller->AddLink(ExecuteContextPin, LoopBodyInput, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
 							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked For_Each ExecuteContext -> %s (loop body)"),
@@ -1332,8 +1386,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				if (PostLoopNode) {
 					URigVMPin* PostLoopInput = GetExecInputPin(PostLoopNode);
 					if (PostLoopInput) {
-						BreakExistingLinks(PostLoopInput);
-
 						FString FailureReason;
 						if (Controller->AddLink(CompletedPin, PostLoopInput, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
 							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked For_Each Completed -> %s (post-loop)"),
@@ -1347,8 +1399,217 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 			}
 
-			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.2 complete -- %d For_Each dispatch links fixed"), DispatchFixes);
+			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.2 complete -- %d For_Each dispatch links created"), DispatchFixes);
 		}
+	}
+
+	/* Phase 1.0: Create remaining exec links by walking bytecodes in instruction order.
+	   Runs AFTER 1.1/1.2 so it only connects nodes not already linked by branch/dispatch routing. */
+	{
+		int32 ExecLinksCreated = 0;
+
+		auto GetExecInputPin = [](URigVMNode* Node) -> URigVMPin* {
+			if (!Node) return nullptr;
+			for (URigVMPin* P : Node->GetPins()) {
+				if (P && P->GetCPPType().Contains(TEXT("Execute")) &&
+					(P->GetDirection() == ERigVMPinDirection::Input || P->GetDirection() == ERigVMPinDirection::IO)) {
+					return P;
+				}
+			}
+			return nullptr;
+		};
+
+		auto GetExecOutputPin = [](URigVMNode* Node) -> URigVMPin* {
+			if (!Node) return nullptr;
+			URigVMPin* CompletedPin = nullptr;
+			URigVMPin* FirstOutputPin = nullptr;
+			for (URigVMPin* P : Node->GetPins()) {
+				if (P && P->GetCPPType().Contains(TEXT("Execute")) &&
+					P->GetDirection() != ERigVMPinDirection::Input) {
+					if (!FirstOutputPin) FirstOutputPin = P;
+					if (P->GetName() == TEXT("Completed")) {
+						CompletedPin = P;
+						break;
+					}
+				}
+			}
+			return CompletedPin ? CompletedPin : FirstOutputPin;
+		};
+
+		struct FExecChainNode {
+			URigVMNode* Node = nullptr;
+			int32 InstructionIndex = INDEX_NONE;
+			bool bIsEntry = false;
+			bool bIsBranch = false;
+			bool bIsDispatch = false;
+		};
+		TArray<FExecChainNode> ExecChain;
+
+		for (int32 i = 0; i < InstructionsArray->Num(); ++i) {
+			const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[i]->AsObject();
+			if (!InstrObj.IsValid()) continue;
+
+			int32 OpCode = 0;
+			InstrObj->TryGetNumberField(TEXT("OpCode"), OpCode);
+			if (OpCode != 101) continue;
+
+			int32 FunctionIndex = 0;
+			InstrObj->TryGetNumberField(TEXT("FunctionIndex"), FunctionIndex);
+			if (FunctionIndex < 0 || FunctionIndex >= FunctionNames.Num()) continue;
+
+			const FString& FullName = FunctionNames[FunctionIndex];
+			FString TypeName;
+			int32 DoubleColon = FullName.Find(TEXT("::"));
+			if (DoubleColon != INDEX_NONE) {
+				TypeName = FullName.Left(DoubleColon);
+			} else {
+				TypeName = FullName;
+			}
+
+			URigVMNode* Node = nullptr;
+			for (const FCreatedNodeInfo& CI : CreatedNodes) {
+				if (CI.InstructionIndex == i) {
+					Node = CI.Node;
+					break;
+				}
+			}
+			if (!Node) continue;
+
+			bool bHasExecPin = false;
+			for (URigVMPin* P : Node->GetPins()) {
+				if (P && P->GetCPPType().Contains(TEXT("Execute"))) { bHasExecPin = true; break; }
+			}
+			if (!bHasExecPin) continue;
+
+			FExecChainNode ChainNode;
+			ChainNode.Node = Node;
+			ChainNode.InstructionIndex = i;
+			ChainNode.bIsEntry = TypeName.Contains(TEXT("BeginExecution")) || TypeName.Contains(TEXT("InverseExecution")) || TypeName.Contains(TEXT("PrepareForExecution"));
+			ChainNode.bIsBranch = TypeName.Contains(TEXT("ControlFlowBranch"));
+			ChainNode.bIsDispatch = TypeName.StartsWith(TEXT("DISPATCH_"));
+			ExecChain.Add(MoveTemp(ChainNode));
+		}
+
+		/* Walk the chain and create exec links for nodes NOT already connected.
+		   Skip any node whose exec input already has a source link (set by 1.1/1.2). */
+		URigVMNode* PrevExecOutputNode = nullptr;
+
+		for (int32 ci = 0; ci < ExecChain.Num(); ++ci) {
+			const FExecChainNode& Cur = ExecChain[ci];
+
+			if (Cur.bIsEntry) {
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 entry point '%s' at [%d]"), *Cur.Node->GetName(), Cur.InstructionIndex);
+				PrevExecOutputNode = Cur.Node;
+				continue;
+			}
+
+			URigVMPin* DstPin = GetExecInputPin(Cur.Node);
+			bool bAlreadyConnected = DstPin && DstPin->GetSourceLinks().Num() > 0;
+
+			if (bAlreadyConnected) {
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 '%s' at [%d] -- already connected, skip"),
+					*Cur.Node->GetName(), Cur.InstructionIndex);
+			} else if (!PrevExecOutputNode) {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 1.0 '%s' at [%d] -- NO prev node, exec input UNLINKED"),
+					*Cur.Node->GetName(), Cur.InstructionIndex);
+			} else {
+				URigVMPin* SrcPin = GetExecOutputPin(PrevExecOutputNode);
+				if (!SrcPin) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 1.0 '%s' at [%d] -- prev '%s' has no exec output pin!"),
+						*Cur.Node->GetName(), Cur.InstructionIndex, *PrevExecOutputNode->GetName());
+				} else if (!DstPin) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 1.0 '%s' at [%d] -- has no exec input pin!"),
+						*Cur.Node->GetName(), Cur.InstructionIndex);
+				} else if (SrcPin == DstPin) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 1.0 '%s' -- src == dst pin"), *Cur.Node->GetName());
+				} else {
+					FString FailureReason;
+					if (Controller->AddLink(SrcPin, DstPin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
+						ExecLinksCreated++;
+						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 Linked exec %s -> %s"),
+							*PrevExecOutputNode->GetNodePath(), *Cur.Node->GetNodePath());
+					} else {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 1.0 exec link FAILED %s -> %s: %s"),
+							*PrevExecOutputNode->GetNodePath(), *Cur.Node->GetNodePath(), *FailureReason);
+					}
+				}
+			}
+
+			if (Cur.bIsBranch || Cur.bIsDispatch) {
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 %s '%s' at [%d] -- chain break"),
+					Cur.bIsBranch ? TEXT("branch") : TEXT("dispatch"), *Cur.Node->GetName(), Cur.InstructionIndex);
+				/* After a branch/dispatch, continue the chain from whatever the
+				   Completed output was connected to by Phase 1.1/1.2. */
+				PrevExecOutputNode = nullptr;
+				for (URigVMPin* P : Cur.Node->GetPins()) {
+					if (!P || !P->GetCPPType().Contains(TEXT("Execute"))) continue;
+					if (P->GetName() == TEXT("Completed") || P->GetName() == TEXT("ExecuteContext")) {
+						TArray<URigVMLink*> TL = P->GetTargetLinks();
+						if (TL.Num() > 0 && TL[0]->GetTargetPin()) {
+							PrevExecOutputNode = TL[0]->GetTargetPin()->GetNode();
+							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 %s chain continues from Completed target '%s'"),
+								Cur.bIsBranch ? TEXT("branch") : TEXT("dispatch"), *PrevExecOutputNode->GetName());
+						}
+						break;
+					}
+				}
+			} else {
+				PrevExecOutputNode = Cur.Node;
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.0 complete -- %d exec links created"), ExecLinksCreated);
+	}
+
+	/* Phase 1.9: Validate all exec links are complete.
+	   Check every created node for unlinked exec input.
+	   Check ALL event nodes in the graph for unlinked exec output. */
+	{
+		int32 UnlinkedExecNodes = 0;
+		int32 DeadEventNodes = 0;
+
+		for (const FCreatedNodeInfo& Info : CreatedNodes) {
+			URigVMNode* Node = Info.Node;
+			if (!Node) continue;
+
+			URigVMPin* ExecInput = nullptr;
+			for (URigVMPin* P : Node->GetPins()) {
+				if (P && P->GetCPPType().Contains(TEXT("Execute")) &&
+					(P->GetDirection() == ERigVMPinDirection::Input || P->GetDirection() == ERigVMPinDirection::IO)) {
+					ExecInput = P;
+					break;
+				}
+			}
+
+			if (ExecInput && ExecInput->GetSourceLinks().Num() == 0) {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: UNLINKED exec input on '%s' at [%d]"),
+					*Node->GetName(), Info.InstructionIndex);
+				UnlinkedExecNodes++;
+			}
+		}
+
+		for (const TObjectPtr<URigVMNode>& GNode : Graph->GetNodes()) {
+			if (!GNode || !GNode->IsEvent()) continue;
+
+			URigVMPin* ExecOutput = nullptr;
+			FString OutputPinName;
+			for (URigVMPin* P : GNode->GetPins()) {
+				if (P && P->GetCPPType().Contains(TEXT("Execute")) &&
+					(P->GetDirection() == ERigVMPinDirection::Output || P->GetDirection() == ERigVMPinDirection::IO)) {
+					ExecOutput = P;
+					OutputPinName = P->GetName();
+					break;
+				}
+			}
+
+			if (ExecOutput && ExecOutput->GetTargetLinks().Num() == 0) {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: DEAD event '%s' output exec '%s' has NO links"),
+					*GNode->GetName(), *OutputPinName);
+				DeadEventNodes++;
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.9 -- %d unlinked exec inputs, %d dead event nodes"), UnlinkedExecNodes, DeadEventNodes);
 	}
 
 	/* Phase 1.5: Set pin defaults from LiteralMemory constants */
@@ -1357,7 +1618,15 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			TArray<URigVMPin*> Result;
 			if (!Node) return Result;
 			for (URigVMPin* Pin : Node->GetPins()) {
-				if (Pin && !Pin->GetCPPType().Contains(TEXT("Execute"))) {
+				if (!Pin || Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+				if (Pin->IsArray()) {
+					TArray<URigVMPin*> SubPins = Pin->GetSubPins();
+					if (SubPins.Num() > 0) {
+						for (URigVMPin* Sub : SubPins) { if (Sub) Result.Add(Sub); }
+					} else {
+						Result.Add(Pin);
+					}
+				} else {
 					Result.Add(Pin);
 				}
 			}
@@ -1465,7 +1734,15 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			TArray<URigVMPin*> Result;
 			if (!Node) return Result;
 			for (URigVMPin* Pin : Node->GetPins()) {
-				if (Pin && !Pin->GetCPPType().Contains(TEXT("Execute"))) {
+				if (!Pin || Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+				if (Pin->IsArray()) {
+					TArray<URigVMPin*> SubPins = Pin->GetSubPins();
+					if (SubPins.Num() > 0) {
+						for (URigVMPin* Sub : SubPins) { if (Sub) Result.Add(Sub); }
+					} else {
+						Result.Add(Pin);
+					}
+				} else {
 					Result.Add(Pin);
 				}
 			}
@@ -1556,7 +1833,13 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 					}
 				} else {
 					FString PinPath = DestPin->GetPinPath();
-					Controller->SetPinDefaultValue(PinPath, DefaultValue, false, false);
+					if (!PinPath.IsEmpty()) {
+						FString FailureReason;
+						if (!Controller->SetPinDefaultValue(PinPath, DefaultValue, false, false)) {
+							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: SetPinDefaultValue failed %s.%s = '%s': %s"),
+								*Node->GetName(), *DestPin->GetName(), *DefaultValue, *FailureReason);
+						}
+					}
 				}
 
 				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Set work default %s.%s = '%s' (Reg[%d])"),
@@ -1578,28 +1861,6 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 	WorkRegisterSources.SetNum(WorkProperties.Num());
 	TArray<TArray<FSourcePin>> WorkRegisterSubPinSources;
 	WorkRegisterSubPinSources.SetNum(WorkProperties.Num());
-
-	auto GetNonExecPins = [](URigVMNode* Node) -> TArray<URigVMPin*> {
-		TArray<URigVMPin*> Result;
-		if (!Node) return Result;
-		for (URigVMPin* Pin : Node->GetPins()) {
-			if (Pin && !Pin->GetCPPType().Contains(TEXT("Execute"))) {
-				if (Pin->IsArray()) {
-					TArray<URigVMPin*> SubPins = Pin->GetSubPins();
-					if (SubPins.Num() > 0) {
-						for (URigVMPin* Sub : SubPins) {
-							if (Sub) Result.Add(Sub);
-						}
-					} else {
-						Result.Add(Pin);
-					}
-				} else {
-					Result.Add(Pin);
-				}
-			}
-		}
-		return Result;
-	};
 
 	for (int32 i = 0; i < InstructionsArray->Num(); ++i) {
 		const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[i]->AsObject();
@@ -1650,6 +1911,11 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			}
 
 			if (Pin && (Pin->GetDirection() == ERigVMPinDirection::Output || Pin->GetDirection() == ERigVMPinDirection::IO)) {
+				if (WorkRegisterSources[RegIdx].Node && WorkRegisterSources[RegIdx].Node != Node) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: WorkReg[%d] writer OVERWRITTEN from %s.%s -> %s.%s"),
+						RegIdx, *WorkRegisterSources[RegIdx].Node->GetName(), *WorkRegisterSources[RegIdx].Pin->GetName(),
+						*Node->GetName(), *Pin->GetName());
+				}
 				WorkRegisterSources[RegIdx].Node = Node;
 				WorkRegisterSources[RegIdx].Pin = Pin;
 			}
@@ -1708,6 +1974,21 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 					CopiesPropagated++;
 					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Bridge propagated ExtReg[%d] -> WorkReg[%d] (source: %s.%s)"),
 						SrcRegIdx, TgtRegIdx, *BridgeSrc->Node->GetName(), *BridgeSrc->Pin->GetName());
+				} else {
+					URigVMVariableNode** GetterPtr = ExternalVarNodes.Find(SrcRegIdx);
+					if (GetterPtr && *GetterPtr) {
+						URigVMPin* ValuePin = nullptr;
+						for (URigVMPin* P : (*GetterPtr)->GetPins()) {
+							if (P && P->GetName() == TEXT("Value")) { ValuePin = P; break; }
+						}
+						if (ValuePin) {
+							WorkRegisterSources[TgtRegIdx].Node = *GetterPtr;
+							WorkRegisterSources[TgtRegIdx].Pin = ValuePin;
+							CopiesPropagated++;
+							UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Ext->Work getter linked ExtReg[%d] -> WorkReg[%d] (var: %s)"),
+								SrcRegIdx, TgtRegIdx, *ExternalVariables[SrcRegIdx].Name);
+						}
+					}
 				}
 			}
 			continue;
@@ -1857,7 +2138,11 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		if (!ArgsArray) continue;
 
 		for (int32 a = 0; a < ArgsArray->Num(); ++a) {
-			if (a >= DataPins.Num()) break;
+			if (a >= DataPins.Num()) {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s arg[%d] has no pin (only %d pins)"),
+					*Node->GetName(), a, DataPins.Num());
+				break;
+			}
 
 			const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
 			if (!ArgObj.IsValid()) continue;
@@ -1867,17 +2152,38 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			ERigVMPinDirection DestDir = DestPin->GetDirection();
 			if (DestDir != ERigVMPinDirection::Input) continue;
 
+			if (DestPin->IsArray()) {
+				TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+				if (SubPins.Num() > 0) {
+					int32 LinkCount = 0;
+					for (URigVMPin* Sub : SubPins) {
+						if (Sub && Sub->GetSourceLinks().Num() > 0) LinkCount++;
+					}
+					if (LinkCount < SubPins.Num()) {
+						DestPin = SubPins[LinkCount];
+					}
+				}
+			}
+
 			int32 MemType = 0, RegIdx = 0;
 			ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
 			ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
 
 			if (MemType != 0) continue;
-			if (RegIdx < 0 || RegIdx >= WorkRegisterSources.Num()) continue;
+			if (RegIdx < 0 || RegIdx >= WorkRegisterSources.Num()) {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s RegIdx=%d out of range [0,%d)"),
+					*Node->GetName(), *DestPin->GetName(), RegIdx, WorkRegisterSources.Num());
+				continue;
+			}
 
 			const TArray<FSourcePin>& SubSources = WorkRegisterSubPinSources[RegIdx];
 			if (SubSources.Num() > 0) {
 				for (const FSourcePin& SubSrc : SubSources) {
-					if (!SubSrc.Pin || !SubSrc.Node) continue;
+					if (!SubSrc.Pin || !SubSrc.Node) {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s Reg[%d] sub-pin source is null"),
+							*Node->GetName(), *DestPin->GetName(), RegIdx);
+						continue;
+					}
 
 					URigVMPin* SrcPin = SubSrc.Pin;
 					if (!SubSrc.SrcSubPinPath.IsEmpty()) {
@@ -1903,101 +2209,113 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 			} else {
 				const FSourcePin& Src = WorkRegisterSources[RegIdx];
-				if (!Src.Pin || !Src.Node) continue;
+				if (!Src.Pin || !Src.Node) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s Reg[%d] has no writer"),
+						*Node->GetName(), *DestPin->GetName(), RegIdx);
+					continue;
+				}
 				TryLinkPins(Src.Node, Src.Pin, Node, DestPin);
 			}
 		}
 	}
 
-	/* Phase 4: Create variable getter nodes for External (ChildProperties) and link to input pins */
+	/* Phase 4: Create external variable links (getter -> input pins, output pins -> setter).
+	   Runs AFTER Phase 3 so all work-memory data links are done first. */
 	int32 ExtLinksCreated = 0;
-	float ExtPosY = PosY + 300.0f;
 
-	for (const FCreatedNodeInfo& Info : CreatedNodes) {
-		URigVMNode* Node = Info.Node;
-		const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[Info.InstructionIndex]->AsObject();
-		if (!InstrObj.IsValid()) continue;
+	{
+		for (const FCreatedNodeInfo& Info : CreatedNodes) {
+			URigVMNode* Node = Info.Node;
+			const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[Info.InstructionIndex]->AsObject();
+			if (!InstrObj.IsValid()) continue;
 
-		TArray<URigVMPin*> DataPins = GetNonExecPins(Node);
+			int32 OpCode = 0;
+			InstrObj->TryGetNumberField(TEXT("OpCode"), OpCode);
+			if (OpCode != 101) continue;
 
-		const TArray<TSharedPtr<FJsonValue>>* ArgsArray = nullptr;
-		InstrObj->TryGetArrayField(TEXT("Arguments"), ArgsArray);
-		if (!ArgsArray) continue;
+			TArray<URigVMPin*> DataPins = GetNonExecPins(Node);
 
-		for (int32 a = 0; a < ArgsArray->Num(); ++a) {
-			if (a >= DataPins.Num()) break;
+			const TArray<TSharedPtr<FJsonValue>>* ArgsArray = nullptr;
+			InstrObj->TryGetArrayField(TEXT("Arguments"), ArgsArray);
+			if (!ArgsArray) continue;
 
-			const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
-			if (!ArgObj.IsValid()) continue;
+			for (int32 a = 0; a < ArgsArray->Num(); ++a) {
+				if (a >= DataPins.Num()) break;
 
-			URigVMPin* DestPin = DataPins[a];
-			if (!DestPin) continue;
-			if (DestPin->GetDirection() != ERigVMPinDirection::Input) continue;
+				const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
+				if (!ArgObj.IsValid()) continue;
 
-			int32 MemType = 0, RegIdx = 0;
-			ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
-			ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+				int32 MemType = 0, RegIdx = 0;
+				ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
+				ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+				if (MemType != 2) continue;
+				if (RegIdx < 0 || RegIdx >= ExternalVariables.Num()) continue;
 
-			if (MemType != 2) continue;
-			if (RegIdx < 0 || RegIdx >= ExternalVariables.Num()) continue;
+				URigVMPin* DestPin = DataPins[a];
+				if (!DestPin) continue;
 
-			const FExternalVariable& Var = ExternalVariables[RegIdx];
+				ERigVMPinDirection PinDir = DestPin->GetDirection();
+				const FExternalVariable& Var = ExternalVariables[RegIdx];
 
-			URigVMVariableNode* VarNode = nullptr;
-			if (URigVMVariableNode** Found = ExternalVarNodes.Find(RegIdx)) {
-				VarNode = *Found;
-			}
+				if (PinDir == ERigVMPinDirection::Input) {
+					URigVMVariableNode** GetterPtr = ExternalVarNodes.Find(RegIdx);
+					if (!GetterPtr || !(*GetterPtr)) {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: No getter node for var '%s' Reg[%d]"), *Var.Name, RegIdx);
+						continue;
+					}
+					URigVMVariableNode* GetterNode = *GetterPtr;
 
-			if (!VarNode) {
-				UStruct* CPPTypeObject = nullptr;
-				if (Var.CPPType != TEXT("double") && Var.CPPType != TEXT("float") && Var.CPPType != TEXT("bool") && Var.CPPType != TEXT("int32") && Var.CPPType != TEXT("int64")) {
-					CPPTypeObject = FindFirstObject<UStruct>(*Var.CPPType, EFindFirstObjectOptions::NativeFirst);
+					URigVMPin* ValuePin = nullptr;
+					for (URigVMPin* P : GetterNode->GetPins()) {
+						if (P && P->GetName() == TEXT("Value")) { ValuePin = P; break; }
+					}
+					if (!ValuePin) continue;
+
+					FString FailureReason;
+					if (Controller->AddLink(ValuePin, DestPin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
+						ExtLinksCreated++;
+						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked var getter '%s' -> %s.%s"),
+							*Var.Name, *Node->GetName(), *DestPin->GetName());
+					} else {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Var getter link failed '%s' -> %s.%s: %s"),
+							*Var.Name, *Node->GetName(), *DestPin->GetName(), *FailureReason);
+					}
 				}
+				else if (PinDir == ERigVMPinDirection::Output || PinDir == ERigVMPinDirection::IO) {
+					int32 SetterKey = -RegIdx - 1;
+					URigVMVariableNode** SetterPtr = ExternalVarNodes.Find(SetterKey);
+					if (!SetterPtr || !(*SetterPtr)) {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: No setter node for var '%s' Reg[%d]"), *Var.Name, RegIdx);
+						continue;
+					}
+					URigVMVariableNode* SetterNode = *SetterPtr;
 
-				VarNode = Controller->AddVariableNode(
-					FName(*Var.Name),
-					Var.CPPType,
-					CPPTypeObject,
-					true,
-					Var.DefaultValue,
-					FVector2D(0.0f, ExtPosY),
-					FString(),
-					false,
-					false
-				);
+					URigVMPin* ValuePin = nullptr;
+					for (URigVMPin* P : SetterNode->GetPins()) {
+						if (P && P->GetName() == TEXT("Value") && P->GetDirection() == ERigVMPinDirection::Input) {
+							ValuePin = P;
+							break;
+						}
+					}
+					if (!ValuePin) continue;
 
-				if (VarNode) {
-					ExternalVarNodes.Add(RegIdx, VarNode);
-					ExtPosY += 200.0f;
-					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Created variable getter '%s' (type='%s')"), *Var.Name, *Var.CPPType);
-				} else {
-					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Failed to create variable getter '%s'"), *Var.Name);
-					continue;
+					FString FailureReason;
+					if (Controller->AddLink(DestPin, ValuePin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
+						ExtLinksCreated++;
+						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked %s.%s -> var setter '%s'"),
+							*Node->GetName(), *DestPin->GetName(), *Var.Name);
+					} else {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Var setter link failed %s.%s -> '%s': %s"),
+							*Node->GetName(), *DestPin->GetName(), *Var.Name, *FailureReason);
+					}
 				}
-			}
-
-			URigVMPin* ValuePin = nullptr;
-			for (URigVMPin* Pin : VarNode->GetPins()) {
-				if (Pin && Pin->GetName() == TEXT("Value")) {
-					ValuePin = Pin;
-					break;
-				}
-			}
-			if (!ValuePin) continue;
-
-			FString FailureReason;
-			if (Controller->AddLink(ValuePin, DestPin, false, ERigVMPinDirection::Invalid, false, false, &FailureReason)) {
-				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Linked var '%s' -> %s.%s"),
-					*Var.Name, *Node->GetName(), *DestPin->GetName());
-				ExtLinksCreated++;
-			} else {
-				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Var link failed '%s' -> %s.%s: %s"),
-					*Var.Name, *Node->GetName(), *DestPin->GetName(), *FailureReason);
 			}
 		}
+
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 4 complete -- %d ext var links created"), ExtLinksCreated);
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Graph created with %d nodes, %d data links, %d var links for '%s'"), NodesCreated, DataLinksCreated, ExtLinksCreated, *InControlRigBlueprint->GetName());
+	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Graph created with %d nodes, %d data links, %d ext var links for '%s'"), NodesCreated, DataLinksCreated, ExtLinksCreated, *InControlRigBlueprint->GetName());
 
 	/* Phase 5: Resolve any remaining dispatch template nodes with wildcard pins */
 	int32 TemplatesResolved = 0;
@@ -2042,5 +2360,161 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		TemplatesResolved++;
 	}
 	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 complete -- %d dispatch nodes, %d wildcards resolved"), TemplatesResolved, WildcardsResolved);
+
+	/* Phase 6: Dump created graph state as bytecode-style JSON.
+	   Everything comes from the graph object — zero input JSON. */
+	{
+		FString JsonStr = TEXT("{\n");
+
+		/* Build a map: InstructionIndex -> FCreatedNodeInfo */
+		TMap<int32, const FCreatedNodeInfo*> InstrToNode;
+		for (const FCreatedNodeInfo& CI : CreatedNodes) {
+			if (CI.Node && CI.InstructionIndex != INDEX_NONE) {
+				InstrToNode.Add(CI.InstructionIndex, &CI);
+			}
+		}
+
+		/* Gather all instruction indices and sort them */
+		TArray<int32> SortedIndices;
+		InstrToNode.GetKeys(SortedIndices);
+		SortedIndices.Sort();
+
+		/* --- Instructions array (mirrors input JSON structure, populated from graph) --- */
+		JsonStr += TEXT("  \"Instructions\": [\n");
+		for (int32 si = 0; si < SortedIndices.Num(); ++si) {
+			int32 Idx = SortedIndices[si];
+			const FCreatedNodeInfo* CI = InstrToNode[Idx];
+			URigVMNode* Node = CI->Node;
+
+			FString FuncName;
+			if (CI->FunctionIndex >= 0 && CI->FunctionIndex < FunctionNames.Num()) {
+				FuncName = FunctionNames[CI->FunctionIndex];
+			}
+
+			/* Collect all pins as Arguments: each pin with its source link */
+			FString ArgsStr = TEXT("[");
+			TArray<URigVMPin*> Pins = Node->GetPins();
+			int32 ArgCount = 0;
+			for (URigVMPin* Pin : Pins) {
+				if (!Pin) continue;
+				FString Dir;
+				switch (Pin->GetDirection()) {
+					case ERigVMPinDirection::Input: Dir = TEXT("In"); break;
+					case ERigVMPinDirection::Output: Dir = TEXT("Out"); break;
+					case ERigVMPinDirection::IO: Dir = TEXT("IO"); break;
+					default: Dir = TEXT("??"); break;
+				}
+
+				/* Get source node name for this pin */
+				FString SrcNode = TEXT("null");
+				FString SrcPin = TEXT("null");
+				TArray<URigVMLink*> SrcLinks = Pin->GetSourceLinks();
+				if (SrcLinks.Num() > 0 && SrcLinks[0]->GetSourcePin()) {
+					SrcNode = SrcLinks[0]->GetSourcePin()->GetNode()->GetName();
+					SrcPin = SrcLinks[0]->GetSourcePin()->GetName();
+				}
+
+				ArgsStr += FString::Printf(TEXT("{\"Pin\":\"%s\",\"Dir\":\"%s\",\"Type\":\"%s\",\"SrcNode\":\"%s\",\"SrcPin\":\"%s\"}"),
+					*Pin->GetName(), *Dir, *Pin->GetCPPType(), *SrcNode, *SrcPin);
+				if (ArgCount < Pins.Num() - 1) ArgsStr += TEXT(",");
+				ArgCount++;
+			}
+			ArgsStr += TEXT("]");
+
+			/* Check if node has exec input/output and their link status */
+			FString ExecIn = TEXT("none");
+			FString ExecOut = TEXT("none");
+			for (URigVMPin* Pin : Pins) {
+				if (!Pin || !Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+				if (Pin->GetDirection() == ERigVMPinDirection::Input || Pin->GetDirection() == ERigVMPinDirection::IO) {
+					TArray<URigVMLink*> SL = Pin->GetSourceLinks();
+					if (SL.Num() > 0 && SL[0]->GetSourcePin()) {
+						ExecIn = SL[0]->GetSourcePin()->GetNode()->GetName() + TEXT(".") + SL[0]->GetSourcePin()->GetName();
+					}
+				}
+				if (Pin->GetDirection() == ERigVMPinDirection::Output || Pin->GetDirection() == ERigVMPinDirection::IO) {
+					TArray<URigVMLink*> TL = Pin->GetTargetLinks();
+					if (TL.Num() > 0 && TL[0]->GetTargetPin()) {
+						ExecOut = TL[0]->GetTargetPin()->GetNode()->GetName() + TEXT(".") + TL[0]->GetTargetPin()->GetName();
+					}
+				}
+			}
+
+			JsonStr += FString::Printf(TEXT("    {\"Idx\":%d,\"Func\":\"%s\",\"Node\":\"%s\",\"ExecIn\":\"%s\",\"ExecOut\":\"%s\",\"Args\":%s}%s"),
+				Idx, *FuncName, *Node->GetName(), *ExecIn, *ExecOut, *ArgsStr,
+				(si < SortedIndices.Num() - 1) ? TEXT(",") : TEXT(""));
+			JsonStr += TEXT("\n");
+		}
+		JsonStr += TEXT("  ],\n");
+
+		/* --- All graph nodes (including those not in CreatedNodes) --- */
+		TArray<URigVMNode*> AllNodes;
+		if (Graph) {
+			for (const TObjectPtr<URigVMNode>& N : Graph->GetNodes()) {
+				if (N) AllNodes.Add(N);
+			}
+		}
+
+		JsonStr += TEXT("  \"AllGraphNodes\": [\n");
+		for (int32 ni = 0; ni < AllNodes.Num(); ++ni) {
+			URigVMNode* Node = AllNodes[ni];
+			FString NodeName = Node->GetName();
+			FString NodePath = Node->GetNodePath();
+
+			FString ExecIn = TEXT("none");
+			FString ExecOut = TEXT("none");
+			TArray<URigVMPin*> Pins = Node->GetPins();
+			for (URigVMPin* Pin : Pins) {
+				if (!Pin || !Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+				if (Pin->GetDirection() == ERigVMPinDirection::Input || Pin->GetDirection() == ERigVMPinDirection::IO) {
+					TArray<URigVMLink*> SL = Pin->GetSourceLinks();
+					if (SL.Num() > 0 && SL[0]->GetSourcePin()) {
+						ExecIn = SL[0]->GetSourcePin()->GetNode()->GetName() + TEXT(".") + SL[0]->GetSourcePin()->GetName();
+					}
+				}
+				if (Pin->GetDirection() == ERigVMPinDirection::Output || Pin->GetDirection() == ERigVMPinDirection::IO) {
+					TArray<URigVMLink*> TL = Pin->GetTargetLinks();
+					if (TL.Num() > 0 && TL[0]->GetTargetPin()) {
+						ExecOut = TL[0]->GetTargetPin()->GetNode()->GetName() + TEXT(".") + TL[0]->GetTargetPin()->GetName();
+					}
+				}
+			}
+
+			JsonStr += FString::Printf(TEXT("    {\"Idx\":%d,\"Name\":\"%s\",\"Path\":\"%s\",\"ExecIn\":\"%s\",\"ExecOut\":\"%s\",\"PinCount\":%d}%s"),
+				ni, *NodeName, *NodePath, *ExecIn, *ExecOut, Pins.Num(),
+				(ni < AllNodes.Num() - 1) ? TEXT(",") : TEXT(""));
+			JsonStr += TEXT("\n");
+		}
+		JsonStr += TEXT("  ],\n");
+
+		/* --- Summary --- */
+		int32 TotalExecLinks = 0;
+		int32 TotalDataLinks = 0;
+		for (int32 ni = 0; ni < AllNodes.Num(); ++ni) {
+			for (URigVMPin* Pin : AllNodes[ni]->GetPins()) {
+				if (!Pin) continue;
+				TArray<URigVMLink*> TL = Pin->GetTargetLinks();
+				for (URigVMLink* L : TL) {
+					if (L && L->GetSourcePin() && L->GetTargetPin()) {
+						if (L->GetSourcePin()->GetCPPType().Contains(TEXT("Execute")) ||
+							L->GetTargetPin()->GetCPPType().Contains(TEXT("Execute"))) {
+							TotalExecLinks++;
+						} else {
+							TotalDataLinks++;
+						}
+					}
+				}
+			}
+		}
+
+		JsonStr += FString::Printf(TEXT("  \"Summary\": {\"TotalNodes\":%d,\"CreatedNodes\":%d,\"ExecLinks\":%d,\"DataLinks\":%d}\n"),
+			AllNodes.Num(), CreatedNodes.Num(), TotalExecLinks, TotalDataLinks);
+
+		JsonStr += TEXT("}\n");
+
+		FString DumpPath = FPaths::ProjectSavedDir() / TEXT("Logs") / TEXT("BytecodeDump.json");
+		FFileHelper::SaveStringToFile(JsonStr, *DumpPath);
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 6 -- graph dump written to '%s'"), *DumpPath);
+	}
 #endif
 }
