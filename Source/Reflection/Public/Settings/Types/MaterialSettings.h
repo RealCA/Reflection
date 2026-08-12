@@ -71,4 +71,15 @@ public:
 		FRMaterialFallbackPinMapping{ { TEXT("emissive") }, EReflectionMaterialPin::EmissiveColor },
 		FRMaterialFallbackPinMapping{ { TEXT("ambient occlusion"), TEXT("ambientocclusion") }, EReflectionMaterialPin::AmbientOcclusion }
 	};
+
+	/* Optional folder to check for "<MaterialName>.recipe.json" files - full
+	 * reconstructed node-formula recipes produced offline by running
+	 * material_reconstructor.py against a captured shader bytecode dump for
+	 * that material (see Importers/Types/Materials/MaterialFormulaBuilder.h).
+	 * When a recipe exists for a material being imported, it takes priority
+	 * over FallbackPinMappings/the built-in heuristics for whichever pins it
+	 * covers, since it's an actual reconstructed formula rather than a name
+	 * guess. Left empty (default), nothing here runs. */
+	UPROPERTY(EditAnywhere, Config, Category = MaterialSettings)
+	FString ReconstructionRecipesDirectory;
 };

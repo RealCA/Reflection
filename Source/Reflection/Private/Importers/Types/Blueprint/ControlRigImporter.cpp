@@ -1,6 +1,8 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Blueprint/ControlRigImporter.h"
+#include "Settings/ReflectionSettings.h"
+#include "Settings/SettingsAccess.h"
 
 #if ENGINE_UE5
 #include "ControlRigDeveloper/Public/ControlRigBlueprintLegacy.h"
@@ -798,6 +800,15 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		int32 InstructionIndex = INDEX_NONE;
 		int32 FunctionIndex = INDEX_NONE;
 		FString FullName;
+
+		int32 OpCode = 0;
+		struct FArgInfo {
+			int32 MemType = 0;
+			int32 RegIdx = 0;
+			int32 RegOffset = 65535;
+			FString DebugStr;
+		};
+		TArray<FArgInfo> BytecodeArgs;
 	};
 	TArray<FCreatedNodeInfo> CreatedNodes;
 
@@ -960,6 +971,21 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			Info.InstructionIndex = i;
 			Info.FunctionIndex = FunctionIndex;
 			Info.FullName = FullName;
+			Info.OpCode = OpCode;
+
+			const TArray<TSharedPtr<FJsonValue>>* InstrArgs = nullptr;
+			if (InstrObj->TryGetArrayField(TEXT("Arguments"), InstrArgs)) {
+				for (const TSharedPtr<FJsonValue>& ArgVal : *InstrArgs) {
+					const TSharedPtr<FJsonObject>& AO = ArgVal->AsObject();
+					if (!AO.IsValid()) continue;
+					FCreatedNodeInfo::FArgInfo AI;
+					AO->TryGetNumberField(TEXT("MemoryType"), AI.MemType);
+					AO->TryGetNumberField(TEXT("RegisterIndex"), AI.RegIdx);
+					AO->TryGetNumberField(TEXT("RegisterOffset"), AI.RegOffset);
+					AI.DebugStr = FString::Printf(TEXT("MemType=%d RegIdx=%d Off=%d"), AI.MemType, AI.RegIdx, AI.RegOffset);
+					Info.BytecodeArgs.Add(MoveTemp(AI));
+				}
+			}
 			CreatedNodes.Add(MoveTemp(Info));
 
 			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Created node '%s' for '%s'"), *FullName, *InControlRigBlueprint->GetName());
@@ -1717,7 +1743,129 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 					}
 				} else {
 					FString PinPath = DestPin->GetPinPath();
-					Controller->SetPinDefaultValue(PinPath, DefaultValue, false, false);
+						if (!Controller->SetPinDefaultValue(PinPath, DefaultValue, false, false)) {
+							TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+
+							/* Array pin: expand to match element count, then set each element */
+							if (DestPin->IsArray()) {
+								/* Count elements in value: e.g. "((a),(b),(c))" has 3 */
+								FString ArrayWork = DefaultValue;
+								ArrayWork.RemoveFromStart(TEXT("("));
+								ArrayWork.RemoveFromEnd(TEXT(")"));
+								int32 ElemCount = 0;
+								{
+									int32 ANest = 0;
+									bool bAStr = false;
+									for (int32 ci = 0; ci < ArrayWork.Len(); ++ci) {
+										TCHAR C = ArrayWork[ci];
+										if (C == TEXT('"')) bAStr = !bAStr;
+										if (!bAStr) {
+											if (C == TEXT('{') || C == TEXT('(')) ANest++;
+											else if (C == TEXT('}') || C == TEXT(')')) ANest--;
+											else if (C == TEXT(',') && ANest == 0) ElemCount++;
+										}
+									}
+									ElemCount++;
+								}
+								/* Expand array to match */
+								while (SubPins.Num() < ElemCount) {
+									FString NewPinPath = Controller->AddArrayPin(PinPath, TEXT(""), false, false);
+									if (NewPinPath.IsEmpty()) break;
+									SubPins = DestPin->GetSubPins();
+								}
+								/* Parse each element and set on the corresponding sub-pin */
+								TArray<FString> ElemStrs;
+								FString ElemWork = DefaultValue;
+								ElemWork.RemoveFromStart(TEXT("("));
+								ElemWork.RemoveFromEnd(TEXT(")"));
+								int32 ENest = 0;
+								bool bEStr = false;
+								int32 EStart = 0;
+								for (int32 ci = 0; ci <= ElemWork.Len(); ++ci) {
+									TCHAR C = (ci < ElemWork.Len()) ? ElemWork[ci] : TEXT(',');
+									if (C == TEXT('"')) bEStr = !bEStr;
+									if (!bEStr) {
+										if (C == TEXT('{') || C == TEXT('(')) ENest++;
+										else if (C == TEXT('}') || C == TEXT(')')) ENest--;
+										else if ((C == TEXT(',') && ENest == 0) || ci == ElemWork.Len()) {
+											ElemStrs.Add(ElemWork.Mid(EStart, ci - EStart).TrimStartAndEnd());
+											EStart = ci + 1;
+										}
+									}
+								}
+								SubPins = DestPin->GetSubPins();
+								for (int32 ei = 0; ei < ElemStrs.Num() && ei < SubPins.Num(); ++ei) {
+									if (!SubPins[ei]) continue;
+									FString Ev = ElemStrs[ei];
+									/* If element is a struct, recurse */
+									if (SubPins[ei]->GetSubPins().Num() > 0 && !SubPins[ei]->IsArray()) {
+										FString Inner = Ev;
+										Inner.RemoveFromStart(TEXT("{"));
+										Inner.RemoveFromEnd(TEXT("}"));
+										for (URigVMPin* SSub : SubPins[ei]->GetSubPins()) {
+											if (!SSub || SSub->IsArray()) continue;
+											FString SSearch = SSub->GetName() + TEXT(":");
+											int32 SI = Inner.Find(SSearch, ESearchCase::CaseSensitive);
+											if (SI == INDEX_NONE) continue;
+											int32 SVS = SI + SSearch.Len();
+											while (SVS < Inner.Len() && Inner[SVS] == TEXT(' ')) SVS++;
+											int32 SVE = SVS;
+											int32 SN = 0;
+											bool bIS = false;
+											while (SVE < Inner.Len()) {
+												TCHAR Ch = Inner[SVE];
+												if (Ch == TEXT('"')) bIS = !bIS;
+												if (!bIS) {
+													if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) SN++;
+													else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (SN == 0) break; SN--; }
+													else if (Ch == TEXT(',') && SN == 0) break;
+												}
+												SVE++;
+											}
+											FString SSV = Inner.Mid(SVS, SVE - SVS).TrimEnd();
+											if (!SSV.IsEmpty()) {
+												Controller->SetPinDefaultValue(SSub->GetPinPath(), SSV, false, false);
+											}
+										}
+									} else if (!Ev.IsEmpty()) {
+										Controller->SetPinDefaultValue(SubPins[ei]->GetPinPath(), Ev, false, false);
+									}
+								}
+							}
+							/* Struct pin: parse "FieldName:Value" pairs */
+							else if (SubPins.Num() > 0) {
+							FString Work = DefaultValue;
+							Work.RemoveFromStart(TEXT("{"));
+							Work.RemoveFromEnd(TEXT("}"));
+							Work.RemoveFromStart(TEXT("("));
+							Work.RemoveFromEnd(TEXT(")"));
+							for (URigVMPin* SubPin : SubPins) {
+								if (!SubPin || SubPin->IsArray()) continue;
+								FString SubName = SubPin->GetName();
+								FString SearchKey = SubName + TEXT(":");
+								int32 KeyIdx = Work.Find(SearchKey, ESearchCase::CaseSensitive);
+								if (KeyIdx == INDEX_NONE) continue;
+								int32 ValStart = KeyIdx + SearchKey.Len();
+								while (ValStart < Work.Len() && Work[ValStart] == TEXT(' ')) ValStart++;
+								int32 ValEnd = ValStart;
+								int32 Nest = 0;
+								bool bInString = false;
+								while (ValEnd < Work.Len()) {
+									TCHAR Ch = Work[ValEnd];
+									if (Ch == TEXT('"')) bInString = !bInString;
+									if (!bInString) {
+										if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) Nest++;
+										else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (Nest == 0) break; Nest--; }
+										else if (Ch == TEXT(',') && Nest == 0) break;
+									}
+									ValEnd++;
+								}
+								FString SubVal = Work.Mid(ValStart, ValEnd - ValStart).TrimEnd();
+								if (SubVal.IsEmpty()) continue;
+								Controller->SetPinDefaultValue(SubPin->GetPinPath(), SubVal, false, false);
+							}
+						}
+					}
 				}
 
 				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Set literal default %s.%s = '%s' (Reg[%d])"),
@@ -1834,10 +1982,82 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				} else {
 					FString PinPath = DestPin->GetPinPath();
 					if (!PinPath.IsEmpty()) {
-						FString FailureReason;
 						if (!Controller->SetPinDefaultValue(PinPath, DefaultValue, false, false)) {
-							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: SetPinDefaultValue failed %s.%s = '%s': %s"),
-								*Node->GetName(), *DestPin->GetName(), *DefaultValue, *FailureReason);
+							/* Generic struct fallback: walk sub-pins and parse "FieldName:Value" pairs.
+							   Skip array pins — setting element count via string causes ensure failures. */
+							TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+							if (SubPins.Num() > 0 && !DestPin->IsArray()) {
+								FString Work = DefaultValue;
+								Work.RemoveFromStart(TEXT("{"));
+								Work.RemoveFromEnd(TEXT("}"));
+								Work.RemoveFromStart(TEXT("("));
+								Work.RemoveFromEnd(TEXT(")"));
+								for (URigVMPin* SubPin : SubPins) {
+									if (!SubPin || SubPin->IsArray()) continue;
+									FString SubName = SubPin->GetName();
+									FString SearchKey = SubName + TEXT(":");
+									int32 KeyIdx = Work.Find(SearchKey, ESearchCase::CaseSensitive);
+									if (KeyIdx == INDEX_NONE) continue;
+									int32 ValStart = KeyIdx + SearchKey.Len();
+									/* Skip whitespace */
+									while (ValStart < Work.Len() && Work[ValStart] == TEXT(' ')) ValStart++;
+									int32 ValEnd = ValStart;
+									int32 Nest = 0;
+									bool bInString = false;
+									while (ValEnd < Work.Len()) {
+										TCHAR Ch = Work[ValEnd];
+										if (Ch == TEXT('"')) bInString = !bInString;
+										if (!bInString) {
+											if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) Nest++;
+											else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (Nest == 0) break; Nest--; }
+											else if (Ch == TEXT(',') && Nest == 0) break;
+										}
+										ValEnd++;
+									}
+									FString SubVal = Work.Mid(ValStart, ValEnd - ValStart).TrimEnd();
+									if (SubVal.IsEmpty()) continue;
+									/* If sub-pin itself has sub-pins, recurse (skip if sub-pin is array) */
+									if (SubPin->GetSubPins().Num() > 0 && !SubPin->IsArray()) {
+										FString SubPinPath = SubPin->GetPinPath();
+										if (!Controller->SetPinDefaultValue(SubPinPath, SubVal, false, false)) {
+											/* Recurse into sub-sub-pins */
+											FString Inner = SubVal;
+											Inner.RemoveFromStart(TEXT("{"));
+											Inner.RemoveFromEnd(TEXT("}"));
+											Inner.RemoveFromStart(TEXT("("));
+											Inner.RemoveFromEnd(TEXT(")"));
+											for (URigVMPin* SSub : SubPin->GetSubPins()) {
+												if (!SSub || SSub->IsArray()) continue;
+												FString SSubName = SSub->GetName();
+												FString SSearch = SSubName + TEXT(":");
+												int32 SI = Inner.Find(SSearch, ESearchCase::CaseSensitive);
+												if (SI == INDEX_NONE) continue;
+												int32 SVS = SI + SSearch.Len();
+												while (SVS < Inner.Len() && Inner[SVS] == TEXT(' ')) SVS++;
+												int32 SVE = SVS;
+												int32 SN = 0;
+												bool bIS = false;
+												while (SVE < Inner.Len()) {
+													TCHAR C = Inner[SVE];
+													if (C == TEXT('"')) bIS = !bIS;
+													if (!bIS) {
+														if (C == TEXT('(') || C == TEXT('{') || C == TEXT('[')) SN++;
+														else if (C == TEXT(')') || C == TEXT('}') || C == TEXT(']')) { if (SN == 0) break; SN--; }
+														else if (C == TEXT(',') && SN == 0) break;
+													}
+													SVE++;
+												}
+												FString SSV = Inner.Mid(SVS, SVE - SVS).TrimEnd();
+												if (!SSV.IsEmpty()) {
+													Controller->SetPinDefaultValue(SSub->GetPinPath(), SSV, false, false);
+												}
+											}
+										}
+									} else {
+										Controller->SetPinDefaultValue(SubPin->GetPinPath(), SubVal, false, false);
+									}
+								}
+							}
 						}
 					}
 				}
@@ -1848,6 +2068,77 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			}
 		}
 		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 1.6 complete -- %d work defaults set"), WorkDefaultsSet);
+	}
+
+	/* Phase 2.7: Expand array pins on dispatch nodes to match bytecode argument count.
+	   MUST run BEFORE register source registration so GetNonExecPins returns correct pin count. */
+	{
+		int32 ArraysExpanded = 0;
+		for (const FCreatedNodeInfo& Info : CreatedNodes) {
+			const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[Info.InstructionIndex]->AsObject();
+			if (!InstrObj.IsValid()) continue;
+
+			int32 OpCode = 0;
+			InstrObj->TryGetNumberField(TEXT("OpCode"), OpCode);
+			if (OpCode != 101) continue;
+
+			const TArray<TSharedPtr<FJsonValue>>* ArgsArray = nullptr;
+			InstrObj->TryGetArrayField(TEXT("Arguments"), ArgsArray);
+			if (!ArgsArray) continue;
+
+			URigVMNode* Node = Info.Node;
+			if (!Node) continue;
+
+			int32 NumArgs = ArgsArray->Num();
+
+			TArray<URigVMPin*> ArrayPins;
+			int32 NonArrayPinCount = 0;
+			for (URigVMPin* Pin : Node->GetPins()) {
+				if (!Pin || Pin->GetCPPType().Contains(TEXT("Execute"))) continue;
+				if (Pin->IsArray()) {
+					TArray<URigVMPin*> Subs = Pin->GetSubPins();
+					if (Subs.Num() > 0) {
+						ArrayPins.Add(Pin);
+					} else {
+						NonArrayPinCount++;
+					}
+				} else {
+					NonArrayPinCount++;
+				}
+			}
+
+			int32 CurrentArrayTotal = 0;
+			for (URigVMPin* Ap : ArrayPins) {
+				CurrentArrayTotal += Ap->GetSubPins().Num();
+			}
+			int32 ExtraNeeded = NumArgs - (NonArrayPinCount + CurrentArrayTotal);
+			if (ExtraNeeded <= 0 || ArrayPins.Num() == 0) continue;
+
+			UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 2.7 '%s' needs %d more array elements (%d args, %d current pins)"),
+				*Node->GetName(), ExtraNeeded, NumArgs, NonArrayPinCount + CurrentArrayTotal);
+
+			int32 PerArray = ExtraNeeded / ArrayPins.Num();
+			int32 Remainder = ExtraNeeded % ArrayPins.Num();
+			for (int32 ai = 0; ai < ArrayPins.Num(); ++ai) {
+				URigVMPin* Pin = ArrayPins[ai];
+				TArray<URigVMPin*> SubPins = Pin->GetSubPins();
+				int32 CurrentSize = SubPins.Num();
+				int32 AddCount = PerArray + (ai < Remainder ? 1 : 0);
+				int32 Needed = CurrentSize + AddCount;
+				if (Needed > CurrentSize) {
+					FString PinPath = Pin->GetPinPath();
+					for (int32 i = CurrentSize; i < Needed; ++i) {
+						FString NewPinPath = Controller->AddArrayPin(PinPath, TEXT(""), false, false);
+						if (!NewPinPath.IsEmpty()) {
+							ArraysExpanded++;
+						}
+					}
+					UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 2.7 Expanded '%s' from %d to %d elements"),
+						*Pin->GetName(), CurrentSize, Needed);
+				}
+			}
+		}
+		UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 2.7 complete -- %d array pins expanded"), ArraysExpanded);
 	}
 
 	/* Phase 2: Build register writer map */
@@ -1918,6 +2209,19 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 				WorkRegisterSources[RegIdx].Node = Node;
 				WorkRegisterSources[RegIdx].Pin = Pin;
+			}
+		}
+	}
+
+	/* Diagnostic: log register sources for Select_12/13/14 Result registers (170, 172, 173) */
+	for (int32 CheckReg : {170, 172, 173}) {
+		if (CheckReg >= 0 && CheckReg < WorkRegisterSources.Num()) {
+			const FSourcePin& Src = WorkRegisterSources[CheckReg];
+			if (Src.Node) {
+				UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 2 register check -- WorkReg[%d] writer = %s.%s"),
+					CheckReg, *Src.Node->GetName(), *Src.Pin->GetName());
+			} else {
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 2 register check -- WorkReg[%d] has NO writer"), CheckReg);
 			}
 		}
 	}
@@ -2126,6 +2430,9 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 		return false;
 	};
 
+	/* Phase 3a: Create ALL data links first (work register → input pins).
+	   Separated from literal defaults so SetPinDefaultValue cannot remove links. */
+
 	for (const FCreatedNodeInfo& Info : CreatedNodes) {
 		URigVMNode* Node = Info.Node;
 		const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[Info.InstructionIndex]->AsObject();
@@ -2139,13 +2446,19 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 
 		for (int32 a = 0; a < ArgsArray->Num(); ++a) {
 			if (a >= DataPins.Num()) {
-				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s arg[%d] has no pin (only %d pins)"),
-					*Node->GetName(), a, DataPins.Num());
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) arg[%d] has no pin (only %d pins)"),
+					*Node->GetName(), Info.OpCode, a, DataPins.Num());
 				break;
 			}
 
 			const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
 			if (!ArgObj.IsValid()) continue;
+
+			int32 MemType = 0, RegIdx = 0;
+			ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
+			ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+
+			if (MemType != 0) continue;
 
 			URigVMPin* DestPin = DataPins[a];
 			if (!DestPin) continue;
@@ -2165,14 +2478,9 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 			}
 
-			int32 MemType = 0, RegIdx = 0;
-			ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
-			ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
-
-			if (MemType != 0) continue;
 			if (RegIdx < 0 || RegIdx >= WorkRegisterSources.Num()) {
-				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s RegIdx=%d out of range [0,%d)"),
-					*Node->GetName(), *DestPin->GetName(), RegIdx, WorkRegisterSources.Num());
+				UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) arg[%d] Reg[%d] out of range [0,%d)"),
+					*Node->GetName(), Info.OpCode, a, RegIdx, WorkRegisterSources.Num());
 				continue;
 			}
 
@@ -2180,17 +2488,17 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			if (SubSources.Num() > 0) {
 				for (const FSourcePin& SubSrc : SubSources) {
 					if (!SubSrc.Pin || !SubSrc.Node) {
-						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s Reg[%d] sub-pin source is null"),
-							*Node->GetName(), *DestPin->GetName(), RegIdx);
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) arg[%d] Reg[%d] sub-pin source is null"),
+							*Node->GetName(), Info.OpCode, a, RegIdx);
 						continue;
 					}
 
 					URigVMPin* SrcPin = SubSrc.Pin;
 					if (!SubSrc.SrcSubPinPath.IsEmpty()) {
 						SrcPin = SubSrc.Pin->FindSubPin(SubSrc.SrcSubPinPath);
-						if (!SrcPin) {
-							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Could not find source sub-pin '%s' on %s.%s"),
-								*SubSrc.SrcSubPinPath, *SubSrc.Node->GetName(), *SubSrc.Pin->GetName());
+					if (!SrcPin) {
+						UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) could not find source sub-pin '%s' on %s.%s"),
+							*Node->GetName(), Info.OpCode, *SubSrc.SrcSubPinPath, *SubSrc.Node->GetName(), *SubSrc.Pin->GetName());
 							continue;
 						}
 					}
@@ -2199,8 +2507,8 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 					if (!SubSrc.DstSubPinPath.IsEmpty()) {
 						DstPin = DestPin->FindSubPin(SubSrc.DstSubPinPath);
 						if (!DstPin) {
-							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Could not find dest sub-pin '%s' on %s.%s"),
-								*SubSrc.DstSubPinPath, *Node->GetName(), *DestPin->GetName());
+							UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) could not find dest sub-pin '%s'"),
+								*Node->GetName(), Info.OpCode, *SubSrc.DstSubPinPath);
 							continue;
 						}
 					}
@@ -2210,11 +2518,295 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 			} else {
 				const FSourcePin& Src = WorkRegisterSources[RegIdx];
 				if (!Src.Pin || !Src.Node) {
-					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Data link skipped %s.%s Reg[%d] has no writer"),
-						*Node->GetName(), *DestPin->GetName(), RegIdx);
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3a -- %s (OpCode=%d) arg[%d] Reg[%d] has no writer"),
+						*Node->GetName(), Info.OpCode, a, RegIdx);
 					continue;
 				}
 				TryLinkPins(Src.Node, Src.Pin, Node, DestPin);
+			}
+		}
+	}
+
+	/* Phase 3b: Set literal defaults ONLY on pins that have no links and no default value.
+	   Runs AFTER Phase 3a so SetPinDefaultValue cannot remove data links. */
+	int32 LiteralsSet = 0;
+
+	for (const FCreatedNodeInfo& Info : CreatedNodes) {
+		URigVMNode* Node = Info.Node;
+		const TSharedPtr<FJsonObject>& InstrObj = (*InstructionsArray)[Info.InstructionIndex]->AsObject();
+		if (!InstrObj.IsValid()) continue;
+
+		TArray<URigVMPin*> DataPins = GetNonExecPins(Node);
+
+		const TArray<TSharedPtr<FJsonValue>>* ArgsArray = nullptr;
+		InstrObj->TryGetArrayField(TEXT("Arguments"), ArgsArray);
+		if (!ArgsArray) continue;
+
+		for (int32 a = 0; a < ArgsArray->Num(); ++a) {
+			if (a >= DataPins.Num()) break;
+
+			const TSharedPtr<FJsonObject>& ArgObj = (*ArgsArray)[a]->AsObject();
+			if (!ArgObj.IsValid()) continue;
+
+			int32 MemType = 0, RegIdx = 0;
+			ArgObj->TryGetNumberField(TEXT("MemoryType"), MemType);
+			ArgObj->TryGetNumberField(TEXT("RegisterIndex"), RegIdx);
+
+			if (MemType != 1) continue;
+
+			URigVMPin* DestPin = DataPins[a];
+			if (!DestPin) continue;
+
+			if (DestPin->IsArray()) {
+				TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+				if (SubPins.Num() > 0) {
+					int32 LinkCount = 0;
+					for (URigVMPin* Sub : SubPins) {
+						if (Sub && Sub->GetSourceLinks().Num() > 0) LinkCount++;
+					}
+					if (LinkCount < SubPins.Num()) {
+						DestPin = SubPins[LinkCount];
+					}
+				}
+			}
+
+			if (DestPin->IsLinked()) continue;
+
+			const FString* LitVal = LiteralRegisterValues.Find(RegIdx);
+			if (!LitVal || LitVal->IsEmpty()) continue;
+
+			/* Handle ERigVMTransformSpace enum: convert numeric index to name */
+			if (DestPin->GetCPPType() == TEXT("ERigVMTransformSpace")) {
+				int32 EnumVal = FCString::Atoi(**LitVal);
+				FString EnumName = (EnumVal == 1) ? TEXT("GlobalSpace") : TEXT("LocalSpace");
+				FString PinPath = DestPin->GetPinPath();
+				if (!Controller->SetPinDefaultValue(PinPath, EnumName, false, false, false)) {
+					UE_LOG(LogTemp, Warning, TEXT("ControlRig Importer: Phase 3b -- %s (OpCode=%d) arg[%d] Space enum set failed %s='%s'"),
+						*Node->GetName(), Info.OpCode, a, *DestPin->GetName(), *EnumName);
+				} else {
+					LiteralsSet++;
+				}
+				continue;
+			}
+
+			/* Handle struct pins (FVector, FRotator, FQuat): parse "(x,y,z)" and set sub-pins */
+			if (DestPin->GetCPPType().Contains(TEXT("FVector")) || DestPin->GetCPPType().Contains(TEXT("FRotator")) || DestPin->GetCPPType().Contains(TEXT("FQuat"))) {
+				FString CleanVal = *LitVal;
+				CleanVal.RemoveFromStart(TEXT("("));
+				CleanVal.RemoveFromEnd(TEXT(")"));
+				TArray<FString> Components;
+				CleanVal.ParseIntoArray(Components, TEXT(","));
+				TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+				bool bAllSet = true;
+				for (int32 ci = 0; ci < Components.Num() && ci < SubPins.Num(); ++ci) {
+					if (SubPins[ci] && !SubPins[ci]->IsLinked()) {
+						FString SubPath = SubPins[ci]->GetPinPath();
+						if (!Controller->SetPinDefaultValue(SubPath, Components[ci].TrimEnd(), false, false, false)) {
+							bAllSet = false;
+						}
+					}
+				}
+				if (bAllSet) {
+					LiteralsSet++;
+				}
+				continue;
+			}
+
+			FString PinPath = DestPin->GetPinPath();
+			if (!Controller->SetPinDefaultValue(PinPath, *LitVal, false, false, false)) {
+
+				/* FRuntimeFloatCurve handling: parse "FieldName:Value" for scalar sub-pins,
+				   expand Keys array via AddArrayPin, then set each key's sub-pins. */
+				if (DestPin->GetCPPType().Contains(TEXT("FRuntimeFloatCurve")) || DestPin->GetCPPType().Contains(TEXT("FRichCurve"))) {
+					int32 SubDefaultsSet = 0;
+					TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+
+					FString Work = *LitVal;
+					Work.RemoveFromStart(TEXT("{"));
+					Work.RemoveFromEnd(TEXT("}"));
+
+					for (URigVMPin* SubPin : SubPins) {
+						if (!SubPin) continue;
+
+						if (SubPin->IsArray() && SubPin->GetName() == TEXT("Keys")) {
+							/* Parse Keys array from value string: look for "Keys":( ... ) */
+							FString KeysPattern = TEXT("\"Keys\":");
+							int32 KeysIdx = Work.Find(KeysPattern, ESearchCase::CaseSensitive);
+							if (KeysIdx == INDEX_NONE) continue;
+							int32 ArrStart = KeysIdx + KeysPattern.Len();
+							while (ArrStart < Work.Len() && Work[ArrStart] == TEXT(' ')) ArrStart++;
+							if (ArrStart >= Work.Len() || Work[ArrStart] != TEXT('(')) continue;
+							int32 ArrEnd = ArrStart + 1;
+							int32 ANest = 1;
+							bool bAStr = false;
+							while (ArrEnd < Work.Len() && ANest > 0) {
+								TCHAR C = Work[ArrEnd];
+								if (C == TEXT('"')) bAStr = !bAStr;
+								if (!bAStr) {
+									if (C == TEXT('(')) ANest++;
+									else if (C == TEXT(')')) { ANest--; if (ANest == 0) break; }
+								}
+								ArrEnd++;
+							}
+							FString ArrContent = Work.Mid(ArrStart + 1, ArrEnd - ArrStart - 1).TrimStartAndEnd();
+							if (ArrContent.IsEmpty()) continue;
+
+							/* Split into key elements */
+							TArray<FString> KeyStrs;
+							{
+								int32 KNest = 0;
+								bool bKStr = false;
+								int32 KStart = 0;
+								for (int32 ci = 0; ci <= ArrContent.Len(); ++ci) {
+									TCHAR C = (ci < ArrContent.Len()) ? ArrContent[ci] : TEXT(',');
+									if (C == TEXT('"')) bKStr = !bKStr;
+									if (!bKStr) {
+										if (C == TEXT('(')) KNest++;
+										else if (C == TEXT(')')) KNest--;
+										else if ((C == TEXT(',') && KNest == 0) || ci == ArrContent.Len()) {
+											KeyStrs.Add(ArrContent.Mid(KStart, ci - KStart).TrimStartAndEnd());
+											KStart = ci + 1;
+										}
+									}
+								}
+							}
+
+							/* Expand array to match key count */
+							TArray<URigVMPin*> CurrentSubPins = DestPin->GetSubPins();
+							URigVMPin* KeysPin = nullptr;
+							for (URigVMPin* SP : CurrentSubPins) {
+								if (SP && SP->GetName() == TEXT("Keys")) { KeysPin = SP; break; }
+							}
+							if (KeysPin) {
+								while (KeysPin->GetSubPins().Num() < KeyStrs.Num()) {
+									FString NewPinPath = Controller->AddArrayPin(KeysPin->GetPinPath(), TEXT(""), false, false);
+									if (NewPinPath.IsEmpty()) break;
+									KeysPin = nullptr;
+									for (URigVMPin* SP : DestPin->GetSubPins()) {
+										if (SP && SP->GetName() == TEXT("Keys")) { KeysPin = SP; break; }
+									}
+									if (!KeysPin) break;
+								}
+							}
+
+							/* Set each key element's sub-pins */
+							TArray<URigVMPin*> ElemPins = SubPin->GetSubPins();
+							for (int32 ei = 0; ei < KeyStrs.Num() && ei < ElemPins.Num(); ++ei) {
+								if (!ElemPins[ei] || ElemPins[ei]->IsArray()) continue;
+								FString KWork = KeyStrs[ei];
+								KWork.RemoveFromStart(TEXT("{"));
+								KWork.RemoveFromEnd(TEXT("}"));
+								KWork.RemoveFromStart(TEXT("("));
+								KWork.RemoveFromEnd(TEXT(")"));
+								for (URigVMPin* KSub : ElemPins[ei]->GetSubPins()) {
+									if (!KSub || KSub->IsArray()) continue;
+									FString KSearch = KSub->GetName() + TEXT(":");
+									int32 KI = KWork.Find(KSearch, ESearchCase::CaseSensitive);
+									if (KI == INDEX_NONE) continue;
+									int32 KVS = KI + KSearch.Len();
+									while (KVS < KWork.Len() && KWork[KVS] == TEXT(' ')) KVS++;
+									int32 KVE = KVS;
+									int32 KN = 0;
+									bool bKS = false;
+									while (KVE < KWork.Len()) {
+										TCHAR Ch = KWork[KVE];
+										if (Ch == TEXT('"')) bKS = !bKS;
+										if (!bKS) {
+											if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) KN++;
+											else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (KN == 0) break; KN--; }
+											else if (Ch == TEXT(',') && KN == 0) break;
+										}
+										KVE++;
+									}
+									FString KVal = KWork.Mid(KVS, KVE - KVS).TrimEnd();
+									if (!KVal.IsEmpty()) {
+										if (Controller->SetPinDefaultValue(KSub->GetPinPath(), KVal, false, false, false)) {
+											SubDefaultsSet++;
+										}
+									}
+								}
+							}
+						} else if (!SubPin->IsArray()) {
+							FString SubName = SubPin->GetName();
+							FString SearchKey = SubName + TEXT(":");
+							int32 KeyIdx = Work.Find(SearchKey, ESearchCase::CaseSensitive);
+							if (KeyIdx == INDEX_NONE) continue;
+							int32 ValStart = KeyIdx + SearchKey.Len();
+							while (ValStart < Work.Len() && Work[ValStart] == TEXT(' ')) ValStart++;
+							int32 ValEnd = ValStart;
+							int32 Nest = 0;
+							bool bInString = false;
+							while (ValEnd < Work.Len()) {
+								TCHAR Ch = Work[ValEnd];
+								if (Ch == TEXT('"')) bInString = !bInString;
+								if (!bInString) {
+									if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) Nest++;
+									else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (Nest == 0) break; Nest--; }
+									else if (Ch == TEXT(',') && Nest == 0) break;
+								}
+								ValEnd++;
+							}
+							FString SubVal = Work.Mid(ValStart, ValEnd - ValStart).TrimEnd();
+							if (!SubVal.IsEmpty()) {
+								if (Controller->SetPinDefaultValue(SubPin->GetPinPath(), SubVal, false, false, false)) {
+									SubDefaultsSet++;
+								}
+							}
+						}
+					}
+					if (SubDefaultsSet > 0) {
+						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 3b -- %s curve %s set via sub-pins (%d sub-defaults)"),
+							*Node->GetName(), *DestPin->GetName(), SubDefaultsSet);
+						LiteralsSet++;
+					}
+				}
+				/* Generic struct fallback: walk sub-pins and parse "FieldName:Value" pairs */
+				else {
+					TArray<URigVMPin*> SubPins = DestPin->GetSubPins();
+					int32 SubDefaultsSet = 0;
+					if (SubPins.Num() > 0) {
+						FString Work = *LitVal;
+						Work.RemoveFromStart(TEXT("{"));
+						Work.RemoveFromEnd(TEXT("}"));
+						Work.RemoveFromStart(TEXT("("));
+						Work.RemoveFromEnd(TEXT(")"));
+						for (URigVMPin* SubPin : SubPins) {
+							if (!SubPin || SubPin->IsArray()) continue;
+							FString SubName = SubPin->GetName();
+							FString SearchKey = SubName + TEXT(":");
+							int32 KeyIdx = Work.Find(SearchKey, ESearchCase::CaseSensitive);
+							if (KeyIdx == INDEX_NONE) continue;
+							int32 ValStart = KeyIdx + SearchKey.Len();
+							while (ValStart < Work.Len() && Work[ValStart] == TEXT(' ')) ValStart++;
+							int32 ValEnd = ValStart;
+							int32 Nest = 0;
+							bool bInString = false;
+							while (ValEnd < Work.Len()) {
+								TCHAR Ch = Work[ValEnd];
+								if (Ch == TEXT('"')) bInString = !bInString;
+								if (!bInString) {
+									if (Ch == TEXT('(') || Ch == TEXT('{') || Ch == TEXT('[')) Nest++;
+									else if (Ch == TEXT(')') || Ch == TEXT('}') || Ch == TEXT(']')) { if (Nest == 0) break; Nest--; }
+									else if (Ch == TEXT(',') && Nest == 0) break;
+								}
+								ValEnd++;
+							}
+							FString SubVal = Work.Mid(ValStart, ValEnd - ValStart).TrimEnd();
+							if (SubVal.IsEmpty()) continue;
+							if (Controller->SetPinDefaultValue(SubPin->GetPinPath(), SubVal, false, false, false)) {
+								SubDefaultsSet++;
+							}
+						}
+					}
+					if (SubDefaultsSet > 0) {
+						UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 3b -- %s struct %s set via sub-pins (%d/%d)"),
+							*Node->GetName(), *DestPin->GetName(), SubDefaultsSet, SubPins.Num());
+						LiteralsSet++;
+					}
+					/* else: struct value couldn't be applied — framework default is acceptable */
+				}
+			} else {
+				LiteralsSet++;
 			}
 		}
 	}
@@ -2362,7 +2954,8 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 	UE_LOG(LogTemp, Log, TEXT("ControlRig Importer: Phase 5 complete -- %d dispatch nodes, %d wildcards resolved"), TemplatesResolved, WildcardsResolved);
 
 	/* Phase 6: Dump created graph state as bytecode-style JSON.
-	   Everything comes from the graph object — zero input JSON. */
+	   Controlled by Settings > Reflection > ControlRig Import Debug Dump. */
+	if (GetSettings()->ControlRigImportDebugDump)
 	{
 		FString JsonStr = TEXT("{\n");
 
@@ -2440,8 +3033,18 @@ void IControlRigImporter::DeserializeGraph(UControlRigBlueprint* InControlRigBlu
 				}
 			}
 
-			JsonStr += FString::Printf(TEXT("    {\"Idx\":%d,\"Func\":\"%s\",\"Node\":\"%s\",\"ExecIn\":\"%s\",\"ExecOut\":\"%s\",\"Args\":%s}%s"),
-				Idx, *FuncName, *Node->GetName(), *ExecIn, *ExecOut, *ArgsStr,
+			/* Bytecode args from original JSON */
+			FString BytecodeArgsStr = TEXT("[");
+			for (int32 bi = 0; bi < CI->BytecodeArgs.Num(); ++bi) {
+				const auto& BA = CI->BytecodeArgs[bi];
+				BytecodeArgsStr += FString::Printf(TEXT("{\"MemType\":%d,\"RegIdx\":%d,\"Off\":%d}"),
+					BA.MemType, BA.RegIdx, BA.RegOffset);
+				if (bi < CI->BytecodeArgs.Num() - 1) BytecodeArgsStr += TEXT(",");
+			}
+			BytecodeArgsStr += TEXT("]");
+
+			JsonStr += FString::Printf(TEXT("    {\"Idx\":%d,\"OpCode\":%d,\"Func\":\"%s\",\"Node\":\"%s\",\"ExecIn\":\"%s\",\"ExecOut\":\"%s\",\"Args\":%s,\"Bytecode\":%s}%s"),
+				Idx, CI->OpCode, *FuncName, *Node->GetName(), *ExecIn, *ExecOut, *ArgsStr, *BytecodeArgsStr,
 				(si < SortedIndices.Num() - 1) ? TEXT(",") : TEXT(""));
 			JsonStr += TEXT("\n");
 		}

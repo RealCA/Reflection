@@ -12,6 +12,7 @@
 #pragma once
 
 #if ENGINE_UE5
+#include "Importers/Types/Materials/MaterialFormulaBuilder.h"
 #include "Importers/Types/Materials/MaterialImporter.h"
 
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
@@ -577,6 +578,27 @@ inline bool CreateFallbackGraph(IMaterialImporter* MaterialImporter, const TShar
 	TSet<EReflectionMaterialPin> WiredPins;
 	if (EditorOnlyData->Metallic.Expression != nullptr) WiredPins.Add(EReflectionMaterialPin::Metallic);
 	if (EditorOnlyData->Roughness.Expression != nullptr) WiredPins.Add(EReflectionMaterialPin::Roughness);
+
+	/* Tier 0, above both of the below: an actual reconstructed formula from
+	 * MaterialFormulaBuilder.h, if one was produced offline for this specific
+	 * material. This builds real Lerp/OneMinus/Saturate/Multiply chains
+	 * instead of guessing a single texture per pin, so it takes priority over
+	 * both tiers below for whichever pins it successfully validates. */
+	{
+		TMap<FString, UMaterialExpressionTextureSampleParameter2D*> TexturesByName;
+		for (UMaterialExpressionTextureSampleParameter2D* Param : TextureParams) {
+			if (!Param->ParameterName.IsNone()) {
+				TexturesByName.Add(Param->ParameterName.ToString(), Param);
+			}
+		}
+		const FString MaterialName = Root->GetStringField(TEXT("Name"));
+		if (const TSharedPtr<FJsonObject> Recipe = Reflection::MaterialFormula::TryLoadRecipe(MaterialName)) {
+			const TSet<EReflectionMaterialPin> RecipeWired = Reflection::MaterialFormula::ApplyRecipe(Material, EditorOnlyData, Recipe, TexturesByName, X, Y + 200);
+			WiredPins.Append(RecipeWired);
+			if (RecipeWired.Num() > 0) bCreated = true;
+			UE_LOG(LogReflection, Log, TEXT("Fallback graph for \"%s\": applied a reconstruction recipe, wired %d pin(s) from it."), *MaterialName, RecipeWired.Num());
+		}
+	}
 
 	for (UMaterialExpressionTextureSampleParameter2D* Param : TextureParams) {
 		if (Param->ParameterName.IsNone()) continue;

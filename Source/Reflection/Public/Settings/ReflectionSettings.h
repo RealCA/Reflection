@@ -71,6 +71,17 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = Settings)
 	FRSettings AssetSettings;
 
+	/* Optional folder to check for "<MaterialName>.recipe.json" files - full
+	 * reconstructed node-formula recipes produced offline by running
+	 * material_reconstructor.py against a captured shader bytecode dump for
+	 * that material (see Importers/Types/Materials/MaterialFormulaBuilder.h).
+	 * When a recipe exists for a material being imported, it takes priority
+	 * over FallbackPinMappings/the built-in heuristics for whichever pins it
+	 * covers, since it's an actual reconstructed formula rather than a name
+	 * guess. Left empty (default), nothing here runs. */
+	UPROPERTY(EditAnywhere, Config, Category = Materials)
+	FString ReconstructionRecipesDirectory;
+
 	UPROPERTY(EditAnywhere, Config, Category = Redirectors, meta = (TitleProperty = "Name"))
 	TArray<FRRedirector> Redirectors;
 
@@ -81,4 +92,8 @@ public:
 	/* Enables experimental/developing features. Features may not work as intended. */
 	UPROPERTY(EditAnywhere, Config, DisplayName = "Experiments", Category = Settings, AdvancedDisplay)
 	bool EnableExperiments = false;
+
+	/* Dumps the imported ControlRig graph state as bytecode-style JSON to Saved/Logs/BytecodeDump.json after import. */
+	UPROPERTY(EditAnywhere, Config, DisplayName = "ControlRig Import Debug Dump", Category = Settings, AdvancedDisplay)
+	bool ControlRigImportDebugDump = false;
 };
