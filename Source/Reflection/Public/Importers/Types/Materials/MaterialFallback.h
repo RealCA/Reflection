@@ -588,7 +588,15 @@ inline bool CreateFallbackGraph(IMaterialImporter* MaterialImporter, const TShar
 		TMap<FString, UMaterialExpressionTextureSampleParameter2D*> TexturesByName;
 		for (UMaterialExpressionTextureSampleParameter2D* Param : TextureParams) {
 			if (!Param->ParameterName.IsNone()) {
-				TexturesByName.Add(Param->ParameterName.ToString(), Param);
+				const FString Name = Param->ParameterName.ToString();
+				TexturesByName.Add(Name, Param);
+				// Recipe JSON uses HLSL-style names (e.g. "Alpha_Lower") while
+				// UE parameter names use spaces (e.g. "Alpha Lower"). Add a
+				// normalized variant so both naming conventions resolve.
+				const FString Normalized = Name.Replace(TEXT(" "), TEXT("_"));
+				if (Normalized != Name) {
+					TexturesByName.Add(Normalized, Param);
+				}
 			}
 		}
 		const FString MaterialName = Root->GetStringField(TEXT("Name"));

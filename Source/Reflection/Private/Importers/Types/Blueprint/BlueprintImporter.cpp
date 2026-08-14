@@ -1,6 +1,7 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Blueprint/BlueprintImporter.h"
+#include "BlueprintBytecodeImporter.h"
 
 #include "KismetCompilerModule.h"
 #include "MovieScene.h"
@@ -116,6 +117,7 @@ bool IBlueprintImporter::Import() {
 
 	ConstructScript();
 	ConstructWidgetTree();
+	ProcessBytecode();
 
 	return OnAssetCreation(Blueprint);
 }
@@ -253,4 +255,51 @@ void IBlueprintImporter::ConstructWidgetTree() {
 			}
 		}
 	});
+}
+
+void IBlueprintImporter::ProcessBytecode() const {
+	UE_LOG(LogTemp, Log, TEXT("Processing bytecode..."));
+
+	UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass);
+	if (!GeneratedClass)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("No generated class found"));
+		return;
+	}
+
+	// Get all exports from the container
+	FUObjectExportContainer* Container = GetContainer();
+	if (!Container)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("No container found"));
+		return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>& JsonObjects = Container->JsonObjects;
+	if (JsonObjects.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("No JSON objects found"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("Found %d JSON exports"), JsonObjects.Num());
+
+	// Create bytecode importer
+	FBlueprintBytecodeImporter BytecodeImporter(Blueprint, GeneratedClass);
+
+	// Process dynamic bindings first (from class properties)
+	FUObjectJsonValueExport AssetData = GetAssetDataAsValue();
+	if (AssetData.JsonObject.IsValid() && AssetData.JsonObject->HasField(TEXT("Properties")))
+	{
+		const TSharedPtr<FJsonObject>& Properties = AssetData.JsonObject->GetObjectField(TEXT("Properties"));
+		BytecodeImporter.ProcessDynamicBindings(Properties, JsonObjects);
+	}
+
+	// Process functions
+	BytecodeImporter.ProcessFunctions(JsonObjects);
+
+	// Mark blueprint as structurally modified
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	UE_LOG(LogTemp, Log, TEXT("Bytecode processing completed"));
 }

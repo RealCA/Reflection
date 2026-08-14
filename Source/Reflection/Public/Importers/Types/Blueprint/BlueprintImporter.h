@@ -23,6 +23,9 @@ protected:
 
 	/* Handles WidgetTree, the UI layout for Widget blueprints */
 	void ConstructWidgetTree();
+
+	/* Handles bytecode processing for event graphs and functions */
+	void ProcessBytecode() const;
 };
 
 REGISTER_IMPORTER(IBlueprintImporter, (TArray<FString>{ 

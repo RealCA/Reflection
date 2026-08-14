@@ -110,7 +110,9 @@ public class Reflection : ModuleRules {
 			"ControlRig",
 			"ControlRigDeveloper",
 			"RigVM",
-			"RigVMDeveloper"
+			"RigVMDeveloper",
+			"EnhancedInput",
+			"InputBlueprintNodes"
 #endif
 		});
 		

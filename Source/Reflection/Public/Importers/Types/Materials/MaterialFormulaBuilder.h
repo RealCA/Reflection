@@ -8,6 +8,7 @@
 #include "Materials/MaterialExpressionClamp.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionDivide.h"
+#include "Materials/MaterialExpressionDotProduct.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionOneMinus.h"
@@ -248,6 +249,19 @@ inline FBuildResult BuildRecipeNode(UMaterial* Material, UMaterialEditorOnlyData
 		UMaterialExpressionMultiply* N = NewObject<UMaterialExpressionMultiply>(Material);
 		SetInput(N->A, BuildArg(0));
 		N->B.Expression = NegOne;
+		AddNode(EditorOnlyData, N, X, Y);
+		return Cached({ N, 0 });
+	}
+	if (Op == TEXT("dot")) {
+		// SPIRV-Cross expands dot() into a manual mad-chain of per-component
+		// multiplies in its decompiled output - material_reconstructor.py
+		// recognizes that shape structurally (by the helper function's body,
+		// not by name, since the SSA name is meaningless and differs per
+		// shader) and folds it back to a "dot" op instead of leaving it as
+		// an opaque, unbuildable function call.
+		UMaterialExpressionDotProduct* N = NewObject<UMaterialExpressionDotProduct>(Material);
+		SetInput(N->A, BuildArg(0));
+		SetInput(N->B, BuildArg(1));
 		AddNode(EditorOnlyData, N, X, Y);
 		return Cached({ N, 0 });
 	}

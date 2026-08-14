@@ -5,6 +5,7 @@
 #include "Importers/Constructor/Importer.h"
 #include "Importers/Constructor/ImportJob.h"
 #include "Importers/Constructor/ImportReader.h"
+#include "Importers/Constructor/TypesHelper.h"
 
 #if ENGINE_UE4
 #include "Modules/Toolbar/Dropdowns/CloudToolsDropdownBuilder.h"
@@ -15,8 +16,10 @@
 
 #include "Modules/Toolbar/Tools/ClearImportData.h"
 #include "Modules/Toolbar/Tools/FixUpAssetData.h"
+#include "Modules/UI/TypeSelectionDialog.h"
 #include "Utilities/Dialog.h"
 #include "Utilities/ImportWithHierarchy.h"
+#include "Utilities/JsonHelpers.h"
 #include "Utilities/MissingDependencies.h"
 
 void IToolsDropdownBuilder::Build(FMenuBuilder& MenuBuilder) const {
@@ -56,7 +59,7 @@ void IToolsDropdownBuilder::Build(FMenuBuilder& MenuBuilder) const {
 
 			InnerMenuBuilder.AddMenuEntry(
 				FText::FromString("Reflect Folder of JSON Files"),
-				FText::FromString("Import all JSON files in a folder. Existing assets can be kept or replaced."),
+				FText::FromString("Import JSON files from a folder. Choose which asset types to import."),
 				FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.BspMode"),
 
 				FUIAction(
@@ -76,47 +79,73 @@ void IToolsDropdownBuilder::Build(FMenuBuilder& MenuBuilder) const {
 
 						if (JsonFiles.Num() == 0) return;
 
-						SpawnYesNoPrompt(
-							"Replace Existing Assets?",
-							FString::Printf(TEXT("Found %d JSON file(s).\n\nYes = Replace all (re-import everything)\nNo = Add only new (skip assets already in project)"), JsonFiles.Num()),
-							[JsonFiles](bool bReplaceAll) {
-								if (bReplaceAll) {
-									/* Replace all: import everything */
-									FImportJob::Enqueue(JsonFiles);
-									return;
+						/* Scan all JSON files to collect unique types */
+						TMap<FString, bool> TypeSupportMap;
+
+						for (const FString& File : JsonFiles) {
+							TArray<TSharedPtr<FJsonValue>> DataObjects;
+							if (!DeserializeJSON(File, DataObjects)) continue;
+
+							for (const TSharedPtr<FJsonValue>& Value : DataObjects) {
+								const TSharedPtr<FJsonObject> Obj = Value->AsObject();
+								if (!Obj.IsValid()) continue;
+
+								const FString Type = Obj->GetStringField(TEXT("Type"));
+								if (!Type.IsEmpty() && !TypeSupportMap.Contains(Type)) {
+									TypeSupportMap.Add(Type, CanImport(Type));
 								}
-
-								/* Add only new: filter out files whose UE asset already exists */
-								TArray<FString> Filtered;
-								int32 Skipped = 0;
-
-								for (const FString& File : JsonFiles) {
-									const FString Package = GetPackagePathFromJson(File);
-									if (!Package.IsEmpty() && AssetExistsInProject(Package)) {
-										++Skipped;
-										continue;
-									}
-									Filtered.Add(File);
-								}
-
-								if (Filtered.Num() == 0) {
-									AppendNotification(
-										FText::FromString("Nothing to Import"),
-										FText::FromString(FString::Printf(TEXT("All %d asset(s) already exist in the project."), Skipped)),
-										4.0f,
-										SNotificationItem::CS_Success,
-										true,
-										350.0f
-									);
-									return;
-								}
-
-								UE_LOG(LogReflection, Log, TEXT("Reflect Folder: %d new / %d existing, importing %d"),
-									Filtered.Num(), Skipped, Filtered.Num());
-
-								FImportJob::Enqueue(Filtered);
 							}
-						);
+						}
+
+						if (TypeSupportMap.Num() == 0) return;
+
+						/* Build type entries for the dialog */
+						TArray<FTypeEntry> TypeEntries;
+						for (const auto& Pair : TypeSupportMap) {
+							FTypeEntry Entry;
+							Entry.TypeName = Pair.Key;
+							Entry.bSupported = Pair.Value;
+							Entry.bSelected = true;
+							TypeEntries.Add(Entry);
+						}
+
+						/* Show type selection dialog */
+						if (!ShowTypeSelectionDialog(TypeEntries)) return;
+
+						/* Build selected types set */
+						TSet<FString> SelectedTypes;
+						for (const FTypeEntry& Entry : TypeEntries) {
+							if (Entry.bSelected) {
+								SelectedTypes.Add(Entry.TypeName);
+							}
+						}
+
+						if (SelectedTypes.Num() == 0) return;
+
+						/* Filter files: keep only files whose first export's Type is selected */
+						TArray<FString> Filtered;
+						for (const FString& File : JsonFiles) {
+							TArray<TSharedPtr<FJsonValue>> DataObjects;
+							if (!DeserializeJSON(File, DataObjects)) continue;
+
+							for (const TSharedPtr<FJsonValue>& Value : DataObjects) {
+								const TSharedPtr<FJsonObject> Obj = Value->AsObject();
+								if (!Obj.IsValid()) continue;
+
+								const FString Type = Obj->GetStringField(TEXT("Type"));
+								if (SelectedTypes.Contains(Type)) {
+									Filtered.Add(File);
+									break;
+								}
+							}
+						}
+
+						if (Filtered.Num() == 0) return;
+
+						UE_LOG(LogReflection, Log, TEXT("Reflect Folder: %d types selected, %d files matched"),
+							SelectedTypes.Num(), Filtered.Num());
+
+						FImportJob::Enqueue(Filtered);
 					})
 				),
 				NAME_None
