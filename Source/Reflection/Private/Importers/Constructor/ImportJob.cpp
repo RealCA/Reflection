@@ -8,12 +8,19 @@
 
 #include "Importers/Constructor/ImportReader.h"
 #include "Importers/Constructor/DependencyRegistry.h"
+#include "Importers/Types/Blueprint/BlueprintStubFactory.h"
+
 //crash #include "Utilities/ImportWithHierarchy.h"
 #include "Engine/Log.h"
 #include "Modules/UI/StyleModule.h"
 #include "Engine/EngineUtilities.h"
 #include "Utilities/JsonHelpers.h"
 #include "Modules/Cloud/Remote.h"
+#include "Utilities/SehHelpers.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "HAL/FileManager.h"
+#include "UObject/MetaData.h"
 
 namespace {
 	/* How long one tick may spend importing. Plenty of single exports run well past this and
@@ -120,10 +127,6 @@ namespace {
 				FilePath = FilePath.Replace(TEXT("\\"), TEXT("/"));
 			}
 
-			/* The whole batch was already planned in Enqueue - scanned, validated, checked for
-			 * circular references, and shelled - before this loop took its first step, so this
-			 * asks the registry for the exact container CreateShells built rather than parsing
-			 * the file a second time into a disconnected copy. */
 			FUObjectExportContainer* Container = FAssetDependencyRegistry::Get().GetOrBuildContainer(FilePath);
 
 			if (Container == nullptr) {
@@ -133,8 +136,6 @@ namespace {
 				continue;
 			}
 
-			/* Parsed, but nothing in it the container recognised as an export, so it is finished
-			 * the moment it is opened. Returning it would step straight off the end. */
 			if (Container->Exports.Num() == 0) {
 				UE_LOG(LogReflection, Warning, TEXT("No exports found in \"%s\"."), *FilePath);
 				GJob->ImportedFiles++;
@@ -161,12 +162,21 @@ namespace {
 	bool StepJob() {
 		const double SliceStart = FPlatformTime::Seconds();
 
-		/* Dependency fetches inside these exports still block, and this keeps them painted and
-		 * cancellable while they do. Scoped to the slice, so no progress dialog is ever held
-		 * across frames. */
 		const FBlockingRequestScope BlockingScope(FText::FromString(TEXT("Reflecting from the Cloud")));
 
 		do {
+			/* A guarded compile caught an access violation earlier in this job:
+			 * the process is in an undefined state and continuing churns it into
+			 * a delayed editor crash (08.24: the progress-dialog teardown died
+			 * on corrupted Slate state minutes after the swallowed AV). Abort
+			 * cleanly instead. */
+			if (IsBlueprintCompilePoisoned()) {
+				UE_LOG(LogReflection, Error,
+					TEXT("Import aborted: a blueprint compile hit an access violation earlier in this job. "
+					     "Delete the corrupted asset it named, then re-import."));
+				return false;
+			}
+
 			if (!OpenPendingFile()) {
 				return false;
 			}
@@ -176,7 +186,14 @@ namespace {
 			if (Export == nullptr) continue;
 			if (!GJob->BlueprintType.IsEmpty() && Export->GetType() != GJob->BlueprintType) continue;
 
+			const double ExportStart = FPlatformTime::Seconds();
 			IImportReader::ReadExportAndImport(GJob->Container, Export, GJob->CurrentFile);
+			/* Per-export duration - the 08.25 session hid 80-200s stalls between
+			 * Populate lines and there was no way to tell which export ate it. */
+			UE_LOG(LogReflection, Log, TEXT("[Timing] %s :: %s took %.2fs"),
+				*FPaths::GetCleanFilename(GJob->CurrentFile),
+				*Export->GetName().ToString(),
+				FPlatformTime::Seconds() - ExportStart);
 
 			KeepContainerObjects();
 		} while (FPlatformTime::Seconds() - SliceStart < SliceBudgetSeconds);
@@ -191,26 +208,28 @@ namespace {
 
 		RemoveNotification(GJob->Notification);
 
-		/* Final phase: every deferred compile/PostLoad/save the populate phase queued up
-		 * (FAssetDependencyRegistry::RequestFinalize) now runs, with every shell in the whole
-		 * batch fully populated - including ones a circular reference would otherwise have
-		 * needed only partially loaded to reach. */
 		FAssetDependencyRegistry::Get().RunFinalPhase();
 
 		const int32 Count = GJob->ImportedFiles;
+		const bool bPoisoned = IsBlueprintCompilePoisoned();
 
-		/* Dropped before the notification below, so a handler that starts another import does not
-		 * find this one still standing */
+		FBlueprintStubFactory::ClearStubImports();
 		GJob.Reset();
+
+		ResetBlueprintCompilePoison();
 
 		UE_LOG(LogReflection, Log, TEXT("Reflection finished: %d file(s)."), Count);
 
 		AppendNotification(
-			FText::FromString(FString::Printf(TEXT("Reflected %d file(s)"), Count)),
-			FText::FromString(TEXT("")),
-			4.0f,
+			FText::FromString(bPoisoned
+				? TEXT("Reflection ABORTED - blueprint compile access violation")
+				: FString::Printf(TEXT("Reflected %d file(s)"), Count)),
+			FText::FromString(bPoisoned
+				? TEXT("Delete the corrupted asset named in the log, then re-import")
+				: TEXT("")),
+			8.0f,
 			FReflectionStyle::Get().GetBrush("Toolbar.Icon"),
-			SNotificationItem::CS_Success,
+			bPoisoned ? SNotificationItem::CS_Fail : SNotificationItem::CS_Success,
 			false,
 			310.0f
 		);
@@ -221,9 +240,6 @@ namespace {
 			return;
 		}
 
-		/* Building assets while the game is running in the editor is asking for trouble, so the
-		 * job waits it out rather than racing PIE. Said out loud, because a progress line that
-		 * stops moving on its own reads exactly like the hang this is meant to avoid. */
 		if (IsPlayingInEditor()) {
 			if (const TSharedPtr<SNotificationItem> Item = GJob->Notification.Pin()) {
 				Item->SetText(FText::FromString(TEXT("Reflection paused while in Play In Editor")));
@@ -240,6 +256,95 @@ namespace {
 
 		UpdateNotification();
 	}
+
+	/* SEH wrapper (C2712-clean: no C++ locals). Deletes a stale asset file;
+	 * never let a file op take the editor down. */
+	static bool TryDeleteAssetFileRaw(const TCHAR* DiskFile) {
+		__try {
+			return IFileManager::Get().Delete(DiskFile);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	/* Auto-clean (plan 013): a compile access violation records its blueprint's
+	 * package to Saved/CorruptedImports.txt. On the NEXT enqueue, a recorded
+	 * package is deleted ONLY when every guard holds:
+	 *   1. the on-disk asset carries the "ReflectionStub" metadata tag - proof
+	 *      it is a plugin-created dependency stub, not a real import, not a
+	 *      foreign asset;
+	 *   2. the stub's own source JSON is in THIS run's resolved queue - the
+	 *      deletion is always immediately followed by a fresh re-import.
+	 * Real imports (ReflectionImport tag), foreign assets and anything not
+	 * being re-imported are never touched - only logged. */
+	static void AutoCleanCorruptedImports(const TArray<FString>& ResolvedFiles) {
+		const FString RecordPath = FPaths::ProjectSavedDir() / TEXT("CorruptedImports.txt");
+		TArray<FString> Packages;
+		if (!FFileHelper::LoadFileToStringArray(Packages, *RecordPath)) {
+			return;
+		}
+
+		// Consume the record regardless of outcome: each entry gets one clean attempt.
+		IFileManager::Get().Delete(*RecordPath);
+
+		auto Normalize = [](const FString& In) {
+			FString S = In.Replace(TEXT("\\"), TEXT("/"));
+			return S;
+		};
+
+		for (const FString& RawPackage : Packages) {
+			const FString PackagePath = RawPackage.TrimStartAndEnd();
+			if (PackagePath.IsEmpty()) continue;
+
+			const FString AssetPath = PackagePath + TEXT(".") + FPackageName::GetShortName(PackagePath);
+			UBlueprint* Asset = LoadObject<UBlueprint>(nullptr, *AssetPath);
+			if (!Asset) {
+				UE_LOG(LogReflection, Log, TEXT("AutoClean: %s is not a blueprint package - left alone."), *PackagePath);
+				continue;
+			}
+
+			/* Provenance lives in the package metadata (FMetaData), set at import time. */
+			FString StubSource;
+			if (UPackage* AssetPkg = Asset->GetPackage()) {
+				if (const FString* Tagged = AssetPkg->GetMetaData().FindValue(Asset, TEXT("ReflectionStub"))) {
+					StubSource = *Tagged;
+				}
+			}
+			if (StubSource.IsEmpty()) {
+				UE_LOG(LogReflection, Warning,
+					TEXT("AutoClean: %s is not a plugin-created stub (no ReflectionStub tag) - NEVER touched."),
+					*PackagePath);
+				continue;
+			}
+
+			const FString NormalizedStubSource = Normalize(StubSource);
+			bool bInQueue = false;
+			for (const FString& QueueFile : ResolvedFiles) {
+				if (Normalize(QueueFile).Equals(NormalizedStubSource, ESearchCase::IgnoreCase)) {
+					bInQueue = true;
+					break;
+				}
+			}
+			if (!bInQueue) {
+				UE_LOG(LogReflection, Warning,
+					TEXT("AutoClean: corrupted stub %s (from %s) is not in this import batch - left for the next run that re-imports it."),
+					*PackagePath, *StubSource);
+				continue;
+			}
+
+			if (UPackage* Pkg = FindPackage(nullptr, *PackagePath)) {
+				Pkg->SetDirtyFlag(false);
+			}
+			const FString DiskFile = FPackageName::LongPackageNameToFilename(PackagePath, FPackageName::GetAssetPackageExtension());
+			if (TryDeleteAssetFileRaw(*DiskFile)) {
+				UE_LOG(LogReflection, Log, TEXT("AutoClean: deleted stale stub %s (will be re-imported fresh from %s)"),
+					*PackagePath, *StubSource);
+			} else {
+				UE_LOG(LogReflection, Warning, TEXT("AutoClean: could not delete %s - the re-import will overwrite it."), *DiskFile);
+			}
+		}
+	}
 }
 
 void FImportJob::Enqueue(const TArray<FString>& Files, bool bUseHierarchy) {
@@ -247,62 +352,53 @@ void FImportJob::Enqueue(const TArray<FString>& Files, bool bUseHierarchy) {
 		return;
 	}
 
-	/* A batch import has no inherent order - a folder scan comes back alphabetically, a file
-	 * dialog in selection order - and importing a struct or blueprint before the asset it
-	 * references leaves that reference unresolved: a UDS member whose struct type was still
-	 * absent imports as "Struct unknown (deleted?)". Re-order any multi-file import so every
-	 * dependency comes first, pulling in missing transitive dependencies and leaving existing
-	 * on-disk ones to resolve from disk. A single file needs none of this - its dependencies
-	 * load on demand when the import hits them. */
-	/*crash TArray<FString> Batch = Files;
-
-	if (!bUseHierarchy && Files.Num() > 1) {
-		TSet<FString> Scanned;
-		TSet<FString> OrderedSet;
-		TArray<FString> Ordered;
-
-		for (const FString& File : Files) {
-			Ordered.Append(CollectHierarchyImportOrder(File, Scanned, OrderedSet, /* bSkipExistingDeps */ /*crash true));
-	    }
-
-		if (Ordered.Num() > 0) {
-			Batch = MoveTemp(Ordered);
-			bUseHierarchy = true;
+	/* Resolve BP dependencies: prepend dependency JSONs before the main files */
+	TArray<FString> ResolvedFiles;
+	TSet<FString> Added;
+	for (const FString& File : Files) {
+		TArray<FString> Deps = FBlueprintStubFactory::ResolveDependencies(File);
+		for (int32 i = Deps.Num() - 1; i >= 0; --i) {
+			if (!Added.Contains(Deps[i])) {
+				ResolvedFiles.Insert(Deps[i], 0);
+				Added.Add(Deps[i]);
+			}
 		}
-	}*/
+		if (!Added.Contains(File)) {
+			ResolvedFiles.Add(File);
+			Added.Add(File);
+		}
+	}
+
+	/* The files the user actually picked import as real blueprints, never as stubs.
+	 * A file registered as a dependency stub in an earlier batch is unregistered here
+	 * so importing the real file replaces the stub instead of re-stubbing it. */
+	for (const FString& File : Files) {
+		FBlueprintStubFactory::UnregisterStubImport(File);
+	}
+
+	/* Self-healing (plan 013): remove stale stub assets a previous aborted run
+	 * recorded as compile-faulting, before this job starts. Guarded to tagged
+	 * stubs being re-imported in this very batch. */
+	AutoCleanCorruptedImports(ResolvedFiles);
+
+	UE_LOG(LogReflection, Log, TEXT("Import queue: %d files (%d deps resolved)"), ResolvedFiles.Num(), ResolvedFiles.Num() - Files.Num());
 
 	/* No editor loop to slice against, so there is nothing to hand a frame back to */
 	if (GEditor == nullptr) {
-		for (const FString& File : Files) {
-		//crash for (const FString& File : Batch) {
+		for (const FString& File : ResolvedFiles) {
 			IImportReader::ImportReference(File);
 		}
 
 		return;
 	}
 
-	/* Scans, validates, checks for circular references, and shells every file in this call
-	 * before a single export is imported - see FAssetDependencyRegistry. Only the explicit
- 	 * "Import with Hierarchy" tool needs any of that; regular single-file, batch and folder
- 	 * imports skip it and build the container for each file on demand, like the plugin did
- 	 * before the hierarchy feature existed. */
-	 /*crash before a single export is imported - see FAssetDependencyRegistry. The explicit "Import
-	 * with Hierarchy" tool asks for it directly; a multi-file batch reaches it through the
-	 * dependency-ordered reorder above. A single file skips it and builds the container on
-	 * demand, loading dependencies as its import runs into them. */
 	FAssetDependencyRegistry& Registry = FAssetDependencyRegistry::Get();
 
 	if (bUseHierarchy) {
-		Registry.Plan(Files);
-		//Registry.Plan(Batch);
+		Registry.Plan(ResolvedFiles);
 	}
 
-	/* A file whose /Game/ parent blueprint must be imported first is dropped here - importing
-	 * it would load the parent off disk while this batch is mid-way through creating the
-	 * child's package (the recursive-flush crash). Only the hierarchy preflight flags files,
-	 * so this only ever drops anything when a hierarchy plan is running. */
-	TArray<FString> ImportableFiles = Files;
-	//TArray<FString> ImportableFiles = Batch;
+	TArray<FString> ImportableFiles = ResolvedFiles;
 	if (bUseHierarchy) {
 		FString SkippedNames;
 		FString ParentNames;
@@ -360,6 +456,9 @@ void FImportJob::Enqueue(const TArray<FString>& Files, bool bUseHierarchy) {
 	GJob = MakeUnique<FJobState>();
 	GJob->Files = ImportableFiles;
 
+	/* Fresh job: clear any poison left by an earlier aborted run. */
+	ResetBlueprintCompilePoison();
+
 	GJob->Notification = AppendNotificationWithHandler(
 		FText::FromString(TEXT("Reflecting")),
 		FText::FromString(TEXT("")),
@@ -387,7 +486,6 @@ void FImportJob::Cancel() {
 		return;
 	}
 
-	/* The export in flight is left to finish; only what has not been started is dropped */
 	GJob->Files.SetNum(GJob->FileIndex);
 
 	if (GJob->Container != nullptr) {

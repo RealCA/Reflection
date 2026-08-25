@@ -46,8 +46,19 @@ T* LoadObjectByPath(const FString& Path) {
 }
 
 inline void SavePackage(UPackage* Package) {
+	if (Package == nullptr) {
+		UE_LOG(LogReflection, Error, TEXT("SavePackage: Package is null, skipping."));
+		return;
+	}
+
 	const FString PackageName = Package->GetName();
 	const FString PackageFileName = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
+	const bool bFileExists = IFileManager::Get().FileExists(*PackageFileName);
+
+	UE_LOG(LogReflection, Log, TEXT("SavePackage: '%s'"), *PackageName);
+	UE_LOG(LogReflection, Log, TEXT("  FileName: %s"), *PackageFileName);
+	UE_LOG(LogReflection, Log, TEXT("  File exists before save: %s"), bFileExists ? TEXT("YES") : TEXT("NO"));
+	UE_LOG(LogReflection, Log, TEXT("  Package IsDirty: %s"), Package->IsDirty() ? TEXT("YES") : TEXT("NO"));
 
 #if ENGINE_UE5
 	FSavePackageArgs SaveArgs; {
@@ -56,17 +67,33 @@ inline void SavePackage(UPackage* Package) {
 		SaveArgs.SaveFlags = SAVE_NoError;
 	}
 
-	UPackage::SavePackage(Package, nullptr, *PackageFileName, SaveArgs);
+	const bool bSuccess = UPackage::SavePackage(Package, nullptr, *PackageFileName, SaveArgs);
+	UE_LOG(LogReflection, Log, TEXT("  SavePackage result: %s"), bSuccess ? TEXT("SUCCESS") : TEXT("FAILED"));
 #else
 	UPackage::SavePackage(Package, nullptr, RF_Standalone, *PackageFileName);
 #endif
+
+	const bool bFileExistsAfter = IFileManager::Get().FileExists(*PackageFileName);
+	UE_LOG(LogReflection, Log, TEXT("  File exists after save: %s"), bFileExistsAfter ? TEXT("YES") : TEXT("NO"));
+
+	if (bFileExistsAfter) {
+		const int64 FileSize = IFileManager::Get().FileSize(*PackageFileName);
+		UE_LOG(LogReflection, Log, TEXT("  File size: %lld bytes"), FileSize);
+	}
 }
 
 inline bool HandleAssetCreation(UObject* Asset, UPackage* Package) {
 	if (Asset == nullptr || Package == nullptr) {
-		UE_LOG(LogReflection, Error, TEXT("HandleAssetCreation: skipping null asset or package."));
+		UE_LOG(LogReflection, Error, TEXT("HandleAssetCreation: skipping null asset or package. Asset=%p Package=%p"), Asset, Package);
 		return false;
 	}
+
+	UE_LOG(LogReflection, Log, TEXT("HandleAssetCreation: START for '%s' (class=%s)"), *Asset->GetName(), *Asset->GetClass()->GetName());
+	UE_LOG(LogReflection, Log, TEXT("  Asset outer: %s"), *Asset->GetOuter()->GetFullName());
+	UE_LOG(LogReflection, Log, TEXT("  Asset outermost: %s"), *Asset->GetOutermost()->GetName());
+	UE_LOG(LogReflection, Log, TEXT("  Package param: %s"), *Package->GetName());
+	UE_LOG(LogReflection, Log, TEXT("  Asset outermost == Package: %s"),
+		Asset->GetOutermost() == Package ? TEXT("YES") : TEXT("NO - MISMATCH!"));
 
 	{
 		/* User Failsafe.... */
@@ -81,58 +108,53 @@ inline bool HandleAssetCreation(UObject* Asset, UPackage* Package) {
 		}
 	}
 
+	UE_LOG(LogReflection, Log, TEXT("  Calling FAssetRegistryModule::AssetCreated..."));
 	FAssetRegistryModule::AssetCreated(Asset);
-	if (!Asset->MarkPackageDirty()) return false;
+	UE_LOG(LogReflection, Log, TEXT("  AssetCreated done"));
+
+	const bool bMarkedDirty = Asset->MarkPackageDirty();
+	UE_LOG(LogReflection, Log, TEXT("  MarkPackageDirty: %s"), bMarkedDirty ? TEXT("YES") : TEXT("NO"));
 
 	Package->SetDirtyFlag(true);
+	UE_LOG(LogReflection, Log, TEXT("  Package dirty flag set: %s"), Package->IsDirty() ? TEXT("YES") : TEXT("NO"));
 
 	if (UVectorFieldStatic* VectorFieldStatic = Cast<UVectorFieldStatic>(Asset)) {
 		VectorFieldStatic->InitResource();
 	}
 
-	UE_LOG(LogReflection, Log, TEXT("HandleAssetCreation: \"%s\" registered, running PostEditChange."), *Asset->GetName());
-
+	UE_LOG(LogReflection, Log, TEXT("  Running PostEditChange..."));
 	Asset->PostEditChange();
+	UE_LOG(LogReflection, Log, TEXT("  PostEditChange done"));
 
 #if ENGINE_UE5
-	/* PostEditChange() can kick off async asset compilation (USkeletalMesh::Build()
-	 * queues a background build and returns immediately). Wait for the compilation
-	 * so the asset is fully built before it gets saved, and nothing below races the
-	 * still-running task. */
 	FAssetCompilingManager::Get().FinishCompilationForObjects({Asset});
-	UE_LOG(LogReflection, Log, TEXT("HandleAssetCreation: async compilation finished for \"%s\"."), *Asset->GetName());
+	UE_LOG(LogReflection, Log, TEXT("  Async compilation finished for '%s'"), *Asset->GetName());
 #endif
 
 	Asset->AddToRoot();
+	UE_LOG(LogReflection, Log, TEXT("  AddToRoot done"));
 
-	/* FullyLoad() re-enters the loader on a package this batch is still populating - the shell
-	 * (CreateAssetPackageSafe) already fully loaded it, or deliberately skipped it for a circular
-	 * dependency, where re-loading would run a reference fix-up over the freshly imported - and
-	 * not yet compiled - anim graph, tripping pin-link validation and walking dangling object
-	 * pointers (the IsValidLowLevel assert in GarbageCollection.cpp). Deferred with the rest of
-	 * the batch finalization; only the standalone, non-batch path loads here. */
-	if (FAssetDependencyRegistry::Get().HasPlan()) {
-		UE_LOG(LogReflection, Log, TEXT("HandleAssetCreation: \"%s\" in a dependency plan; skipping FullyLoad (deferred to final phase)."), *Asset->GetName());
+	const bool bHasPlan = FAssetDependencyRegistry::Get().HasPlan();
+	UE_LOG(LogReflection, Log, TEXT("  HasPlan: %s"), bHasPlan ? TEXT("YES") : TEXT("NO"));
+
+	if (bHasPlan) {
+		UE_LOG(LogReflection, Log, TEXT("  In a dependency plan; skipping FullyLoad (deferred to final phase)."));
+	} else if (Asset->IsA<UWorld>()) {
+		UE_LOG(LogReflection, Log, TEXT("  UWorld detected; skipping FullyLoad."));
 	} else {
+		UE_LOG(LogReflection, Log, TEXT("  NOT in a dependency plan; calling FullyLoad."));
 		Package->FullyLoad();
 	}
 
-	/* Deferred to the batch final phase when a dependency plan is running: SyncBrowserToAssets
-	 * renders a thumbnail, which instantiates the anim graph of a freshly created - and not yet
-	 * compiled - AnimBlueprint, tripping pin-link validation and a GC assert on the dangling
-	 * nodes. BrowseToAssetSafe swallows any access violation that still slips through. */
+	UE_LOG(LogReflection, Log, TEXT("  Requesting browse..."));
 	FAssetDependencyRegistry::Get().RequestBrowse(Asset);
+	UE_LOG(LogReflection, Log, TEXT("  RequestBrowse done"));
 
 	if (UVectorFieldStatic* VectorFieldStatic = Cast<UVectorFieldStatic>(Asset)) {
 		VectorFieldStatic->Resource = nullptr;
 	}
 
-	/* PostLoad() is a deserialization hook; calling it on a freshly created,
-	 * in-memory asset is wrong. For USkeletalMesh it even destroys the async build
-	 * task PostEditChange just queued (USkinnedAsset::PostLoad reassigns AsyncTask),
-	 * asserting in the FAsyncTask destructor. Importers that genuinely need extra
-	 * initialization call PostLoad() themselves. */
-
+	UE_LOG(LogReflection, Log, TEXT("HandleAssetCreation: END for '%s'"), *Asset->GetName());
 	return true;
 }
 

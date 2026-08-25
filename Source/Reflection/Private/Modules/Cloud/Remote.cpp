@@ -31,6 +31,24 @@ namespace {
 	 * request of its own. Ticking Slate from inside a Slate tick tears widgets down underneath
 	 * the tick that is still walking them, so the inner pump gives up its repaint instead. */
 	bool GPumping = false;
+
+	/* SEH wrapper (C2712-clean: no C++ locals in this frame). Destroys the blocking
+	 * progress dialog. On a process that already swallowed an access violation the
+	 * Slate teardown can itself fault (08.24 crashes: the editor died here minutes
+	 * after a caught compile AV) - swallow it, drop the half-dead dialog, and let
+	 * the job-abort path take over instead of taking the editor down. */
+	static bool TryResetBlockingProgress() {
+		__try {
+			GBlockingProgress.Reset();
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			/* Drop the (possibly half-deleted) dialog pointer without deleting
+			 * again - the leak is deliberate, the process is being aborted. */
+			(void)GBlockingProgress.Release();
+			return false;
+		}
+	}
 }
 
 FBlockingRequestScope::FBlockingRequestScope(const FText& Description) {
@@ -61,7 +79,7 @@ FBlockingRequestScope::~FBlockingRequestScope() {
 	GDescriptionStack.Pop();
 
 	if (bOwnsProgress) {
-		GBlockingProgress.Reset();
+		TryResetBlockingProgress();
 	}
 }
 

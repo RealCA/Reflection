@@ -22,6 +22,10 @@ struct REFLECTION_API FBlueprintVariables {
 	/* Adds a member variable for every user facing ChildProperty, returns how many were added */
 	static int32 Construct(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>& ChildProperties);
 
+	/* Removes member variables a previous import added that are no longer declared in
+	 * ChildProperties. Returns how many were removed. Safe on first import (nothing to remove). */
+	static int32 ClearStaleVariables(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>& ChildProperties);
+
 	/* Whether a ChildProperty is one the editor would show rather than blueprint plumbing */
 	static bool IsUserVariable(const TSharedPtr<FJsonObject>& Property);
 

@@ -263,6 +263,18 @@ public:
 		return FindByType(FName(*Type));
 	}
 
+	/* Whether this container holds a World export. World containers import only the World export;
+	 * sub-exports (Level, Model, WorldSettings, etc.) are handled internally by the level importer. */
+	bool HasWorldType() const {
+		static const FString WorldType = TEXT("World");
+		for (const FUObjectExport* Export : Exports) {
+			if (Export->GetType().ToString() == WorldType) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/* The blueprint type this container holds (BlueprintGeneratedClass, AnimBlueprintGeneratedClass,
 	 * WidgetBlueprintGeneratedClass or RigVMBlueprintGeneratedClass), or an empty string if it holds
 	 * no blueprint at all. The blueprint importers rebuild the whole blueprint - functions, structs,

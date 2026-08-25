@@ -112,7 +112,8 @@ public class Reflection : ModuleRules {
 			"RigVM",
 			"RigVMDeveloper",
 			"EnhancedInput",
-			"InputBlueprintNodes"
+			"InputBlueprintNodes",
+			"CinematicCamera"
 #endif
 		});
 		

@@ -12,6 +12,9 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "Containers/ExportContainer.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformStackWalk.h"
 #include <Windows.h>
 
 namespace SehHelpersPrivate
@@ -20,9 +23,35 @@ namespace SehHelpersPrivate
 /* Packages currently inside FullyLoad() */
 static TSet<FName> GPackagesBeingFullyLoaded;
 
+/* Set when a guarded compile catches an access violation (plan 013). */
+static bool GBlueprintCompilePoisoned = false;
+
 /*---------------------------------------------------------
  * Blueprint compile
  *--------------------------------------------------------*/
+
+/* Runs as the __except filter, BEFORE unwinding: the faulting stack is still
+ * intact, so a plain backtrace from here names the exact compiler function
+ * that faulted. POD-only frame (C2712). Returns EXCEPTION_EXECUTE_HANDLER. */
+static LONG CompileFaultFilter(EXCEPTION_POINTERS* Info)
+{
+    const DWORD Code = Info->ExceptionRecord ? Info->ExceptionRecord->ExceptionCode : 0;
+    const void* Address = Info->ExceptionRecord ? Info->ExceptionRecord->ExceptionAddress : nullptr;
+
+    UE_LOG(LogReflection, Error,
+        TEXT("Compile fault captured: code=0x%08X address=%p - faulting stack follows."),
+        (uint32)Code, Address);
+
+    uint64 Frames[48] = {};
+    const int32 Depth = FPlatformStackWalk::CaptureStackBackTrace(Frames, 48);
+    for (int32 i = 0; i < Depth; ++i)
+    {
+        ANSICHAR Symbol[1024] = {};
+        FPlatformStackWalk::ProgramCounterToHumanReadableString(i, Frames[i], Symbol, sizeof(Symbol));
+        UE_LOG(LogReflection, Error, TEXT("  [%02d] %hs"), i, Symbol);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 static bool TryCompileBlueprintImpl(UBlueprint* Blueprint, EBlueprintCompileOptions Options)
 {
@@ -30,7 +59,7 @@ static bool TryCompileBlueprintImpl(UBlueprint* Blueprint, EBlueprintCompileOpti
     {
         FKismetEditorUtilities::CompileBlueprint(Blueprint, Options);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (CompileFaultFilter(GetExceptionInformation()))
     {
         return false;
     }
@@ -107,16 +136,140 @@ static UPackage* TryCreatePackage(const TCHAR* Path, bool bSkipFullyLoadRequeste
  * Public API
  *--------------------------------------------------------*/
 
+bool IsBlueprintCompilePoisoned()
+{
+    return SehHelpersPrivate::GBlueprintCompilePoisoned;
+}
+
+void ResetBlueprintCompilePoison()
+{
+    SehHelpersPrivate::GBlueprintCompilePoisoned = false;
+}
+
+/* Normal-function implementation - the SEH wrapper below must stay free of
+ * destructor-bearing locals (C2712). */
+namespace SehHelpersPrivate
+{
+    static void SanitizeIntermediateGraphsImpl(UBlueprint* Blueprint)
+    {
+        if (!Blueprint) return;
+
+        TArray<UEdGraph*> Graphs;
+        for (UEdGraph* Graph : Blueprint->UbergraphPages) Graphs.Add(Graph);
+        for (UEdGraph* Graph : Blueprint->FunctionGraphs) Graphs.Add(Graph);
+
+        for (UEdGraph* Graph : Graphs)
+        {
+            if (!Graph) continue;
+
+            bool bHasRealNode = false;
+            bool bHasIntermediate = false;
+            for (UEdGraphNode* Node : Graph->Nodes)
+            {
+                if (!Node) continue;
+                if (Node->IsIntermediateNode()) bHasIntermediate = true;
+                else bHasRealNode = true;
+            }
+            if (!bHasIntermediate) continue;
+
+            if (!bHasRealNode)
+            {
+                /* The whole graph is compiler scaffolding a faulted compile left
+                 * behind - drop it from the blueprint entirely. */
+                UE_LOG(LogReflection, Warning,
+                    TEXT("SanitizeIntermediateGraphs: removing compiler-intermediate graph \"%s\" left by a faulted compile."),
+                    *Graph->GetName());
+                Blueprint->UbergraphPages.Remove(Graph);
+                Blueprint->FunctionGraphs.Remove(Graph);
+                for (UEdGraphNode* Node : Graph->Nodes)
+                {
+                    if (Node)
+                    {
+                        Node->BreakAllNodeLinks();
+                        Node->MarkAsGarbage();
+                    }
+                }
+                Graph->MarkAsGarbage();
+            }
+            else
+            {
+                UE_LOG(LogReflection, Warning,
+                    TEXT("SanitizeIntermediateGraphs: stripping intermediate node(s) from \"%s\"."),
+                    *Graph->GetName());
+                for (UEdGraphNode* Node : Graph->Nodes)
+                {
+                    if (Node && Node->IsIntermediateNode())
+                    {
+                        Node->BreakAllNodeLinks();
+                        Node->MarkAsGarbage();
+                    }
+                }
+                Graph->Nodes.RemoveAll([](const UEdGraphNode* Node) { return Node && Node->IsIntermediateNode(); });
+            }
+        }
+    }
+
+    static bool TrySanitizeIntermediateGraphs(UBlueprint* Blueprint)
+    {
+        __try
+        {
+            SanitizeIntermediateGraphsImpl(Blueprint);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+}
+
+void SanitizeIntermediateGraphs(UBlueprint* Blueprint)
+{
+    /* Runs on state an access violation just damaged - a fault here must not
+     * take the editor down on top of the compile fault that caused it. */
+    if (!SehHelpersPrivate::TrySanitizeIntermediateGraphs(Blueprint))
+    {
+        UE_LOG(LogReflection, Error, TEXT("SanitizeIntermediateGraphs faulted - blueprint left as-is (job is poisoned anyway)."));
+    }
+}
+
 void CompileBlueprintSafe(UBlueprint* Blueprint, EBlueprintCompileOptions Options)
 {
     if (!SehHelpersPrivate::TryCompileBlueprintImpl(Blueprint, Options))
     {
+        /* The process just survived an access violation: engine state is
+         * undefined from here on. Poison the job so the importer aborts
+         * instead of churning damaged state into a worse crash. */
+        SehHelpersPrivate::GBlueprintCompilePoisoned = true;
+
+        /* Record the package for the next Enqueue's auto-clean (plan 013):
+         * only ReflectionStub-tagged assets whose JSON is re-imported in that
+         * run will actually be deleted - the record itself is just a hint. */
+        const FString PackagePath = Blueprint ? Blueprint->GetPackage()->GetName() : FString();
+        const FString RecordPath = FPaths::ProjectSavedDir() / TEXT("CorruptedImports.txt");
+        if (!PackagePath.IsEmpty())
+        {
+            TArray<FString> Existing;
+            FFileHelper::LoadFileToStringArray(Existing, *RecordPath);
+            Existing.Add(PackagePath);
+            FFileHelper::SaveStringArrayToFile(Existing, *RecordPath);
+            UE_LOG(LogReflection, Error, TEXT("Recorded corrupted import package: %s"), *PackagePath);
+
+            /* Defuse the trojan (plan 013): a faulted compile leaves compiler-
+             * intermediate graphs inside the live blueprint (e.g. a
+             * ReceiveBeginPlay graph calling the missing ubergraph function).
+             * Opening that stub later built a widget for the intermediate node
+             * and crashed Slate. Strip them now, while the job is aborting. */
+            SanitizeIntermediateGraphs(Blueprint);
+        }
+
         UE_LOG(
             LogReflection,
             Error,
             TEXT("Access violation while compiling blueprint \"%s\". "
                  "A referenced ControlRig asset may be corrupted. "
-                 "Try deleting the existing asset and re-importing."),
+                 "Try deleting the existing asset and re-importing. "
+                 "Aborting the import job."),
             *Blueprint->GetName());
     }
 }

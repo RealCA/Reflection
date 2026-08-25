@@ -24,23 +24,34 @@ UObject* IImporter::CreateAsset(UObject* CreatedAsset) {
 void IImporter::Save() const {
 	const UReflectionSettings* Settings = GetSettings();
 
-	/* Ensure the package is valid before proceeding */
-	if (GetPackage() == nullptr) {
+	UPackage* Pkg = GetPackage();
+	UE_LOG(LogReflection, Log, TEXT("IImporter::Save: Package=%s SaveAssets=%s"),
+		Pkg ? *Pkg->GetName() : TEXT("NULL"),
+		Settings->AssetSettings.SaveAssets ? TEXT("true") : TEXT("false"));
+
+	if (Pkg == nullptr) {
 		UE_LOG(LogReflection, Error, TEXT("IImporter::Save: Package is null"));
 		return;
 	}
 
-	/* User option to save packages on import */
 	if (Settings->AssetSettings.SaveAssets) {
 		SavePackage(GetPackage());
 	}
 }
 
 bool IImporter::OnAssetCreation(UObject* Asset) const {
+	UE_LOG(LogReflection, Log, TEXT("IImporter::OnAssetCreation: START for '%s'"),
+		Asset ? *Asset->GetName() : TEXT("NULL"));
+
 	const bool Synced = HandleAssetCreation(Asset, GetPackage());
+	UE_LOG(LogReflection, Log, TEXT("IImporter::OnAssetCreation: HandleAssetCreation returned %s"), Synced ? TEXT("true") : TEXT("false"));
+
 	if (Synced) {
+		UE_LOG(LogReflection, Log, TEXT("IImporter::OnAssetCreation: Calling Save..."));
 		Save();
+		UE_LOG(LogReflection, Log, TEXT("IImporter::OnAssetCreation: Save done"));
 	}
-	
+
+	UE_LOG(LogReflection, Log, TEXT("IImporter::OnAssetCreation: END (Synced=%s)"), Synced ? TEXT("true") : TEXT("false"));
 	return Synced;
 }

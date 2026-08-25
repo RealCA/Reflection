@@ -11,6 +11,7 @@
 #include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_SaveCachedPose.h"
 #include "AnimGraphNode_SequencePlayer.h"
+#include "AnimGraphNode_SequenceEvaluator.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_UseCachedPose.h"
@@ -28,6 +29,8 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Importers/Types/Blueprint/BlueprintUtilities.h"
 #include "Importers/Types/Blueprint/BlueprintVariables.h"
+#include "Importers/Types/Blueprint/BlueprintImporter.h"
+#include "Importers/Types/Blueprint/BlueprintStubFactory.h"
 #include "Utilities/JsonHelpers.h"
 
 #if ENGINE_UE5
@@ -37,13 +40,13 @@
 #include "Utilities/SehHelpers.h"
 
 bool IAnimationBlueprintImporter::Import() {
-	AnimBlueprint = GetSelectedAsset<UAnimBlueprint>(true);
-
-	/* Nothing selected in the content browser doesn't mean nothing is there - reflecting the same animation
-	 * blueprint a second time lands on an asset that already exists, and FKismetEditorUtilities::CreateBlueprint
-	 * asserts outright when any blueprint of that name is already in the package. Reuse it in place instead;
-	 * CreateGraph clears the graph out before rebuilding it. Same handling as IBlueprintImporter::CreateAsset. */
-	if (!AnimBlueprint && GetPackage()) {
+	/* Imports always target the package path from the JSON export, never whatever
+	 * happens to be selected in the content browser. */
+	if (GetPackage()) {
+		/* Reflecting the same animation blueprint a second time lands on an asset that already exists,
+		 * and FKismetEditorUtilities::CreateBlueprint asserts outright when any blueprint of that name
+		 * is already in the package. Reuse it in place instead; CreateGraph clears the graph out before
+		 * rebuilding it. Same handling as IBlueprintImporter::CreateAsset. */
 		/* FindObject mirrors the assert's own lookup. No LoadObject fallback: GetPackage() was already
 		 * fully loaded by CreateAssetPackageSafe just before this runs, so anything on disk is already
 		 * resident in memory - LoadObject on the same path would re-enter the loader for a package
@@ -91,6 +94,10 @@ bool IAnimationBlueprintImporter::Import() {
 	 * FBlueprintVariables filters out.
 	 */
 	if (const TArray<TSharedPtr<FJsonValue>>* ChildProperties; GetAssetExport()->TryGetArrayField(TEXT("ChildProperties"), ChildProperties)) {
+		/* A re-import into an existing blueprint removes variables the previous import
+		 * added that the JSON no longer declares, then rebuilds the ones it does. */
+		FBlueprintVariables::ClearStaleVariables(AnimBlueprint, *ChildProperties);
+
 		if (FBlueprintVariables::Construct(AnimBlueprint, *ChildProperties) > 0) {
 			/* The properties only appear on the generated class once it recompiles */
 			CompileBlueprintSafe(AnimBlueprint, EBlueprintCompileOptions::SkipGarbageCollection);
@@ -269,6 +276,24 @@ bool IAnimationBlueprintImporter::Import() {
 		}
 	}
 
+	/* Function/event reconstruction, on top of the untouched AnimGraph pipeline:
+	 *  - stub imports (dependency AnimBPs) get hollow function/event UFunction
+	 *    shells so dependent BPs resolve casts and calls;
+	 *  - real imports get the event graph + functions decompiled from bytecode
+	 *    (ubergraph body, BlueprintInitializeAnimation/UpdateAnimation, user
+	 *    functions). The "AnimGraph" entry thunk and the compiler-generated
+	 *    EvaluateGraphExposedInputs_* anim-node thunks are skipped inside both
+	 *    paths. The deferred finalize compile below covers either addition. */
+	if (FBlueprintStubFactory::IsStubImport(GetSourceFile())) {
+		FMetaData& PackageMeta = AnimBlueprint->GetPackage()->GetMetaData();
+		PackageMeta.SetValue(AnimBlueprint, TEXT("ReflectionStub"), *GetSourceFile());
+
+		ConstructBlueprintStubFunctions(AnimBlueprint, GetContainer());
+		UE_LOG(LogTemp, Log, TEXT("AnimBP stub import - creating function stubs for: %s"), *GetSourceFile());
+	} else {
+		RunBlueprintBytecodePass(AnimBlueprint, GetAssetData(), GetContainer()->JsonObjects);
+	}
+
 	/* Capture every graph node and container export (and any invalid object among them) before
 	 * the deferred compile, so the log shows the exact state the compile-time reference walk
 	 * descends into when it hits the IsValidLowLevel assert. */
@@ -351,6 +376,9 @@ bool IAnimationBlueprintImporter::Import() {
 						if (UAnimGraphNode_SequencePlayer* SeqNode = Cast<UAnimGraphNode_SequencePlayer>(Node)) {
 							SeqNode->Node.SetSequence(FallbackAnimSequence);
 						}
+						if (UAnimGraphNode_SequenceEvaluator* EvalNode = Cast<UAnimGraphNode_SequenceEvaluator>(Node)) {
+							EvalNode->Node.SetSequence(FallbackAnimSequence);
+						}
 						if (UEdGraphPin* Pin = Node->FindPin(PinName, EGPD_Input)) {
 							Pin->DefaultObject = FallbackAnimSequence;
 						}
@@ -375,19 +403,33 @@ bool IAnimationBlueprintImporter::Import() {
 				if (Graph) {
 					int32 FixedCount = 0;
 					for (UEdGraphNode* GraphNode : Graph->Nodes) {
-						UAnimGraphNode_SequencePlayer* SeqNode = Cast<UAnimGraphNode_SequencePlayer>(GraphNode);
-						if (!SeqNode) continue;
-						if (SeqNode->Node.GetSequence()) continue;
+						bool bFixed = false;
 
-						SeqNode->Node.SetSequence(FallbackAnimSequence);
-						SeqNode->AlwaysDynamicProperties.Add(FName("Sequence"));
-						if (UEdGraphPin* Pin = SeqNode->FindPin(FName("Sequence"), EGPD_Input)) {
-							Pin->DefaultObject = FallbackAnimSequence;
+						if (UAnimGraphNode_SequencePlayer* SeqNode = Cast<UAnimGraphNode_SequencePlayer>(GraphNode)) {
+							if (!SeqNode->Node.GetSequence()) {
+								SeqNode->Node.SetSequence(FallbackAnimSequence);
+								bFixed = true;
+							}
 						}
-						FixedCount++;
+						if (UAnimGraphNode_SequenceEvaluator* EvalNode = Cast<UAnimGraphNode_SequenceEvaluator>(GraphNode)) {
+							if (!EvalNode->Node.GetSequence()) {
+								EvalNode->Node.SetSequence(FallbackAnimSequence);
+								bFixed = true;
+							}
+						}
+
+						if (bFixed) {
+							if (UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(GraphNode)) {
+								AnimNode->AlwaysDynamicProperties.Add(FName("Sequence"));
+							}
+							if (UEdGraphPin* Pin = GraphNode->FindPin(FName("Sequence"), EGPD_Input)) {
+								Pin->DefaultObject = FallbackAnimSequence;
+							}
+							FixedCount++;
+						}
 					}
 					if (FixedCount > 0) {
-						UE_LOG(LogReflection, Warning, TEXT("[DIAG-FINAL] Fixed %d null SequencePlayers"), FixedCount);
+						UE_LOG(LogReflection, Warning, TEXT("[DIAG-FINAL] Fixed %d null SequencePlayer/Evaluator nodes"), FixedCount);
 					}
 				}
 			}
@@ -1196,6 +1238,9 @@ void IAnimationBlueprintImporter::ApplyCompiledPinBindings(FUObjectExport* NodeE
 		if (FallbackAnimSequence && PinName == FName("Sequence")) {
 			if (UAnimGraphNode_SequencePlayer* SeqNode = Cast<UAnimGraphNode_SequencePlayer>(Node)) {
 				SeqNode->Node.SetSequence(FallbackAnimSequence);
+			}
+			if (UAnimGraphNode_SequenceEvaluator* EvalNode = Cast<UAnimGraphNode_SequenceEvaluator>(Node)) {
+				EvalNode->Node.SetSequence(FallbackAnimSequence);
 			}
 			if (UEdGraphPin* Pin = Node->FindPin(PinName, EGPD_Input)) {
 				Pin->DefaultObject = FallbackAnimSequence;

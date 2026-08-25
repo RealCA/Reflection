@@ -309,13 +309,18 @@ void FAssetDependencyRegistry::CreateShells() {
 
 		const FString ContainerType = Container->GetBlueprintType();
 
+		/* World containers import only the World export; sub-exports (Level, Model, WorldSettings,
+		 * etc.) are handled internally by the level importer. Without this, both the Level and World
+		 * exports would be shelled and imported as separate assets. */
+		const bool bHasWorld = Container->HasWorldType();
+
 		/* A blueprint's first export can be its Default__ CDO, whose "Type" is the generated
 		 * class's short name (Foo_C) - not something FindClassByType knows. The container's
 		 * resolved blueprint type (BlueprintGeneratedClass / Anim / Widget / RigVM) is what
 		 * the importer is registered under, so shelling has to key off that when the container
 		 * has one. Without it, ControlRigs and CDO-first blueprints never got a shell, and a
 		 * dependent's LoadClass fell back to a disk load mid-batch (the recursive-flush crash). */
-		const FString ShellType = !ContainerType.IsEmpty() ? ContainerType : Entry.ClassName;
+		FString ShellType = !ContainerType.IsEmpty() ? ContainerType : Entry.ClassName;
 
 		/* UserDefinedEnums are not shelled. An enum's only content is its names, so nothing
 		 * depends on it being built before its dependents - but a shell shadows the real asset
@@ -328,9 +333,16 @@ void FAssetDependencyRegistry::CreateShells() {
 			continue;
 		}
 
+		/* World containers: override shell type to World regardless of Entry.ClassName.
+		 * The first JSON element may be a Level/Model/etc., but the World export is what
+		 * should be shelled and imported. */
+		if (bHasWorld) {
+			ShellType = TEXT("World");
+		}
+
 		FUObjectExport* Export = !ContainerType.IsEmpty()
 			? Container->FindByType(ContainerType)
-			: Container->FindByType(Entry.ClassName);
+			: Container->FindByType(bHasWorld ? TEXT("World") : Entry.ClassName);
 
 		if (!Export->IsJsonValid()) {
 			continue;
@@ -515,6 +527,20 @@ void FAssetDependencyRegistry::RequestBrowse(UObject* Asset) {
 }
 
 void FAssetDependencyRegistry::RunFinalPhase() {
+	/* A compile access violation poisoned this job: the process is in an
+	 * undefined state, and the stub finalizers re-run Construct + compile on
+	 * exactly those damaged blueprints (08.24 crash: the finalizer's variable
+	 * construction died on a blueprint whose compile had just faulted). Skip
+	 * the whole phase - the stubs stay stubs and are rebuilt by the next
+	 * import after the auto-clean. */
+	if (IsBlueprintCompilePoisoned()) {
+		UE_LOG(LogReflection, Error,
+			TEXT("DependencyPlan Step 6/6 Finalize: SKIPPED - a compile access violation aborted this job. "
+			     "Deferred real imports were not run; re-import after the corrupted asset is cleaned."));
+		Reset();
+		return;
+	}
+
 	UE_LOG(LogReflection, Log, TEXT("DependencyPlan Step 6/6 Finalize: running %d deferred finalizer(s)."), PendingFinalizers.Num());
 
 	/* Copied out first: a finalizer can itself import something new (a save triggering asset
@@ -524,6 +550,12 @@ void FAssetDependencyRegistry::RunFinalPhase() {
 	PendingFinalizers.Reset();
 
 	for (const TFunction<void()>& Finalizer : Finalizers) {
+		/* A finalizer can itself trip a compile AV - stop the moment the job is
+		 * poisoned instead of running more finalizers on damaged state. */
+		if (IsBlueprintCompilePoisoned()) {
+			UE_LOG(LogReflection, Error, TEXT("DependencyPlan Step 6/6 Finalize: aborted mid-loop (compile access violation)."));
+			break;
+		}
 		if (Finalizer) {
 			Finalizer();
 		}

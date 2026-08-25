@@ -8,6 +8,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectIterator.h"
 #include "Engine/Notifications.h"
 #include "Utilities/JsonHelpers.h"
 
@@ -51,15 +52,28 @@ inline bool AssetExistsOnDisk(const FString& GamePackagePath) {
 /* True when the asset at a /Game/ path is already resident in memory AND rooted - i.e. fully
  * imported this session (HandleAssetCreation calls AddToRoot), not merely a shell this batch
  * built (shells are never rooted). A StaticLoadObject on a rooted asset resolves against
- * memory and never re-enters the loader. */
+ * memory and never re-enters the loader.
+ *
+ * FindObject on the bare package path returns the UPackage, and only the asset (its child)
+ * gets AddToRoot'd - so a rooted package is never found that way. Scan the package's objects
+ * instead: any rooted object proves a fully-imported asset is resident. A hollow package left
+ * by a failed LoadPackage contains nothing rooted, so it still correctly reports false. */
 inline bool IsAssetFullyImported(const FString& GamePackagePath) {
 	if (!GamePackagePath.StartsWith(TEXT("/Game/"))) return false;
 
-	if (UObject* Existing = FindObject<UObject>(nullptr, *GamePackagePath)) {
-		return Existing->IsRooted();
-	}
+	UPackage* Pkg = FindObject<UPackage>(nullptr, *GamePackagePath);
+	if (!Pkg) return false;
 
-	return false;
+	bool bHasRootedObject = false;
+	ForEachObjectWithOuter(Pkg, [&bHasRootedObject](UObject* Inner) {
+		if (Inner->IsRooted()) {
+			bHasRootedObject = true;
+			return false; /* stop early */
+		}
+		return true;
+	});
+
+	return bHasRootedObject;
 }
 
 /* Extracts all /Game/ asset references from a JSON value tree. OutSeen deduplicates across

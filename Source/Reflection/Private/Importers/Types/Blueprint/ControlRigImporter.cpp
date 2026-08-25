@@ -75,9 +75,9 @@ UObject* IControlRigImporter::CreateAsset(UObject* CreatedAsset) {
 
 bool IControlRigImporter::Import() {
 #if ENGINE_UE5
-	ControlRigBlueprint = GetSelectedAsset<UControlRigBlueprint>(true);
-
-	if (!ControlRigBlueprint && GetPackage()) {
+	/* Imports always target the package path from the JSON export, never whatever
+	 * happens to be selected in the content browser. */
+	if (GetPackage()) {
 		UBlueprint* ExistingBlueprint = FindObject<UBlueprint>(GetPackage(), *GetAssetName());
 
 		if (ExistingBlueprint) {
@@ -115,6 +115,13 @@ bool IControlRigImporter::Import() {
 	if (ClassDefaultObjectExport->IsJsonInvalid()) return false;
 
 	ClassDefaultObjectExport->Object = GeneratedClass;
+
+	const TArray<TSharedPtr<FJsonValue>>* ChildProperties;
+	if (GetAssetExport()->TryGetArrayField(TEXT("ChildProperties"), ChildProperties)) {
+		/* A re-import into an existing blueprint removes variables the previous import
+		 * added that the JSON no longer declares, then rebuilds the ones it does. */
+		FBlueprintVariables::ClearStaleVariables(ControlRigBlueprint, *ChildProperties);
+	}
 
 	if (ConstructVariables() > 0) {
 		CompileBlueprintSafe(ControlRigBlueprint, EBlueprintCompileOptions::SkipGarbageCollection);

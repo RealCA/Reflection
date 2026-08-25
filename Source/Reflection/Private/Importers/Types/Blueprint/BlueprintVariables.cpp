@@ -205,18 +205,33 @@ int32 FBlueprintVariables::Construct(UBlueprint* Blueprint, const TArray<TShared
 		return 0;
 	}
 
+	/* A blueprint with no generated class (a stub whose compile faulted, or a
+	 * compile that never ran) has nowhere to put variables - calling into the
+	 * editor utils here dereferenced null and took the editor down
+	 * (08.24: AV at null+0x14 inside AddMemberVariable). */
+	if (Blueprint->GeneratedClass == nullptr) {
+		UE_LOG(LogReflection, Warning,
+			TEXT("\"%s\" has no GeneratedClass (compile faulted or never ran) - skipping variable construction."),
+			*Blueprint->GetName());
+		return 0;
+	}
+
 	int32 Added = 0;
 	int32 Unsupported = 0;
 
 	for (const TSharedPtr<FJsonValue>& ChildProperty : ChildProperties) {
 		const TSharedPtr<FJsonObject> Property = ChildProperty->AsObject();
-
-		if (!IsUserVariable(Property)) {
+		if (!Property.IsValid()) {
 			continue;
 		}
 
 		FString Name;
 		if (!Property->TryGetStringField(TEXT("Name"), Name) || Name.IsEmpty()) {
+			continue;
+		}
+
+		/* UberGraphFrame is the ubergraph's frame struct, not a variable */
+		if (Name == TEXT("UberGraphFrame")) {
 			continue;
 		}
 
@@ -243,7 +258,27 @@ int32 FBlueprintVariables::Construct(UBlueprint* Blueprint, const TArray<TShared
 			continue;
 		}
 
+		const bool bUserVariable = IsUserVariable(Property);
+
+		/* Compiler-managed temporaries (call results, cast/switch success flags) are
+		 * recreated by the graph nodes themselves during compile, so declaring them
+		 * here would hand the compiled class a duplicate property. */
+		const bool bCompilerManaged = Name.StartsWith(TEXT("CallFunc_")) || Name.StartsWith(TEXT("K2Node_"));
+		if (!bUserVariable && bCompilerManaged) {
+			continue;
+		}
+
 		if (FBlueprintEditorUtils::AddMemberVariable(Blueprint, VariableName, PinType)) {
+			if (!bUserVariable) {
+				/* Internal properties (Temp_int_Loop_Counter_Variable, etc.) are real
+				 * class members the bytecode reads and writes, but not exposed blueprint
+				 * variables. */
+				if (int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VariableName); VarIndex != INDEX_NONE) {
+					FBPVariableDescription& VarDesc = Blueprint->NewVariables[VarIndex];
+					VarDesc.PropertyFlags &= ~(CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintReadOnly | CPF_DisableEditOnInstance);
+				}
+			}
+
 			Added++;
 		} else {
 			UE_LOG(LogReflection, Warning, TEXT("\"%s\" would not take variable \"%s\""), *Blueprint->GetName(), *Name);
@@ -255,4 +290,43 @@ int32 FBlueprintVariables::Construct(UBlueprint* Blueprint, const TArray<TShared
 	}
 
 	return Added;
+}
+
+int32 FBlueprintVariables::ClearStaleVariables(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>& ChildProperties) {
+	if (Blueprint == nullptr) {
+		return 0;
+	}
+
+	/* Collect the variable names the JSON still declares */
+	TSet<FName> JsonVariables;
+	for (const TSharedPtr<FJsonValue>& ChildProperty : ChildProperties) {
+		const TSharedPtr<FJsonObject> Property = ChildProperty->AsObject();
+
+		if (!IsUserVariable(Property)) {
+			continue;
+		}
+
+		FString Name;
+		if (Property->TryGetStringField(TEXT("Name"), Name) && !Name.IsEmpty()) {
+			JsonVariables.Add(FName(*Name));
+		}
+	}
+
+	/* Remove every blueprint-declared variable the previous import added that the JSON
+	 * no longer declares. Iterate backwards so removals don't shift the indices. */
+	int32 Removed = 0;
+	for (int32 i = Blueprint->NewVariables.Num() - 1; i >= 0; --i) {
+		const FName VariableName = Blueprint->NewVariables[i].VarName;
+
+		if (!JsonVariables.Contains(VariableName)) {
+			FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VariableName);
+			Removed++;
+		}
+	}
+
+	if (Removed > 0) {
+		UE_LOG(LogReflection, Log, TEXT("\"%s\" removed %d stale variable(s)"), *Blueprint->GetName(), Removed);
+	}
+
+	return Removed;
 }

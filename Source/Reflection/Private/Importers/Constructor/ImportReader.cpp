@@ -61,9 +61,17 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 	 * *GeneratedClass names, so all of them have to be detected, not just BlueprintGeneratedClass. */
 	const FString ContainerType = Container->GetBlueprintType();
 
+	/* World containers import only the World export; sub-exports (Level, Model, WorldSettings,
+	 * etc.) are handled internally by the level importer. Without this, both the Level and World
+	 * exports would be imported as separate assets. */
+	const bool bHasWorld = Container->HasWorldType();
+
 	for (FUObjectExport* Export : Container->Exports) {
 		if (!ContainerType.IsEmpty()) {
 			if (Export->GetType() != ContainerType) continue;
+		}
+		if (bHasWorld) {
+			if (Export->GetType().ToString() != TEXT("World")) continue;
 		}
 		
 		if (IImporter* Importer = ReadExportAndImport(Container, Export, File, HideNotifications)) OutImporter = Importer;

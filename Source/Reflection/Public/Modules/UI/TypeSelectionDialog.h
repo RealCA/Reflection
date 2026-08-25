@@ -25,7 +25,6 @@ private:
 	TSharedPtr<SListView<TSharedPtr<FTypeEntry>>> ListView;
 	TArray<TSharedPtr<FTypeEntry>> TypeEntries;
 	TArray<FTypeEntry> ResultTypes;
-	bool bAccepted = false;
 
 	TSharedRef<ITableRow> OnGenerateRow(TSharedPtr<FTypeEntry> Item, const TSharedRef<STableViewBase>& OwnerTable);
 	void OnToggleAll(bool bSelect);

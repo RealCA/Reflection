@@ -25,6 +25,20 @@ struct FUObjectExportContainer;
 REFLECTION_API void CompileBlueprintSafe(UBlueprint* Blueprint, EBlueprintCompileOptions Options = EBlueprintCompileOptions::None);
 REFLECTION_API UPackage* CreateAssetPackageSafe(const TCHAR* Path, bool bSkipFullyLoad = false);
 
+/* Poison-flag (plan 013): a caught compile access violation leaves the process
+ * in an undefined state - the 08.24 crashes showed the editor going down
+ * minutes later in unrelated Slate teardown. Once set, the import job aborts
+ * instead of continuing to churn damaged state. */
+REFLECTION_API bool IsBlueprintCompilePoisoned();
+REFLECTION_API void ResetBlueprintCompilePoison();
+
+/* Removes compiler-intermediate graphs and nodes (bIsIntermediateNode) that a
+ * FAULTED compile left inside a live blueprint. 08.24: the aborted compile of
+ * BP_Stockpile left an intermediate ReceiveBeginPlay graph calling the missing
+ * ubergraph function - opening the stub built a widget for that node and took
+ * the editor down (the "trojan stub"). Safe to call on any blueprint. */
+REFLECTION_API void SanitizeIntermediateGraphs(UBlueprint* Blueprint);
+
 /* Dumps the anim graph node state and the container exports that own those nodes right before
  * compilation, so the log captures every object (and any invalid one) the compile-time reference
  * walk will descend into. Guarded by __try/__except: a faulted dump is logged and swallowed

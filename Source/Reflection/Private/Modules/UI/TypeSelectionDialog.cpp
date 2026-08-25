@@ -9,77 +9,66 @@
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SBorder.h"
-#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Styling/CoreStyle.h"
 
 #define LOCTEXT_NAMESPACE "Reflection.TypeSelection"
 
-class STypeSelectionRow : public SMultiColumnTableRow<TSharedPtr<FTypeEntry>> {
+/* Simple row widget — not SMultiColumnTableRow to avoid HeaderRow requirement */
+class STypeSelectionRow : public SCompoundWidget {
 public:
 	SLATE_BEGIN_ARGS(STypeSelectionRow) {}
 		SLATE_ARGUMENT(TSharedPtr<FTypeEntry>, Entry)
-		SLATE_ARGUMENT(TSharedPtr<SListView<TSharedPtr<FTypeEntry>>>, OwnerListView)
 	SLATE_END_ARGS()
 
-	void Construct(const FArguments& InArgs, const TSharedRef<STableViewBase>& OwnerTable) {
+	void Construct(const FArguments& InArgs) {
 		Entry = InArgs._Entry;
-		OwnerListView = InArgs._OwnerListView;
 
-		SMultiColumnTableRow::Construct(FSuperRowType::FArguments(), OwnerTable);
-	}
+		ChildSlot
+		[
+			SNew(SBorder)
+			.Padding(FMargin(4.0f, 2.0f))
+			[
+				SNew(SHorizontalBox)
 
-	virtual TSharedRef<SWidget> GenerateWidgetForColumn(const FName& ColumnId) override {
-		if (ColumnId == FName("Selected")) {
-			return SNew(SBox)
-				.Padding(FMargin(8.0f, 2.0f))
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
 				.VAlign(VAlign_Center)
+				.Padding(0.0f, 0.0f, 8.0f, 0.0f)
 				[
 					SNew(SCheckBox)
 					.IsChecked(Entry->bSelected ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
 					.OnCheckStateChanged_Lambda([this](ECheckBoxState NewState) {
 						Entry->bSelected = (NewState == ECheckBoxState::Checked);
 					})
-				];
-		}
+				]
 
-		if (ColumnId == FName("TypeName")) {
-			return SNew(SBox)
-				.Padding(FMargin(8.0f, 2.0f))
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
 				.VAlign(VAlign_Center)
 				[
 					SNew(STextBlock)
 					.Text(FText::FromString(Entry->TypeName))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-				];
-		}
+				]
 
-		if (ColumnId == FName("Status")) {
-			const FText StatusText = Entry->bSupported
-				? LOCTEXT("Supported", "Supported")
-				: LOCTEXT("NotSupported", "Not Supported");
-
-			const FSlateColor StatusColor = Entry->bSupported
-				? FSlateColor(FLinearColor(0.2f, 0.9f, 0.3f))
-				: FSlateColor(FLinearColor(0.9f, 0.3f, 0.2f));
-
-			return SNew(SBox)
-				.Padding(FMargin(8.0f, 2.0f))
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
 				.VAlign(VAlign_Center)
 				[
 					SNew(STextBlock)
-					.Text(StatusText)
-					.ColorAndOpacity(StatusColor)
+					.Text(Entry->bSupported ? LOCTEXT("Supported", "Supported") : LOCTEXT("NotSupported", "Not Supported"))
+					.ColorAndOpacity(Entry->bSupported
+						? FSlateColor(FLinearColor(0.2f, 0.9f, 0.3f))
+						: FSlateColor(FLinearColor(0.9f, 0.3f, 0.2f)))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-				];
-		}
-
-		return SNullWidget::NullWidget;
+				]
+			]
+		];
 	}
 
 private:
 	TSharedPtr<FTypeEntry> Entry;
-	TSharedPtr<SListView<TSharedPtr<FTypeEntry>>> OwnerListView;
 };
 
 /* STypeSelectionDialog ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -182,9 +171,11 @@ void STypeSelectionDialog::Construct(const FArguments& InArgs) {
 }
 
 TSharedRef<ITableRow> STypeSelectionDialog::OnGenerateRow(TSharedPtr<FTypeEntry> Item, const TSharedRef<STableViewBase>& OwnerTable) {
-	return SNew(STypeSelectionRow, OwnerTable)
-		.Entry(Item)
-		.OwnerListView(ListView);
+	return SNew(STableRow<TSharedPtr<FTypeEntry>>, OwnerTable)
+		[
+			SNew(STypeSelectionRow)
+			.Entry(Item)
+		];
 }
 
 void STypeSelectionDialog::OnToggleAll(bool bSelect) {
@@ -197,7 +188,6 @@ void STypeSelectionDialog::OnToggleAll(bool bSelect) {
 }
 
 void STypeSelectionDialog::OnAccept() {
-	bAccepted = true;
 	ResultTypes.Empty();
 	for (const TSharedPtr<FTypeEntry>& Entry : TypeEntries) {
 		ResultTypes.Add(*Entry);
@@ -209,7 +199,6 @@ void STypeSelectionDialog::OnAccept() {
 }
 
 void STypeSelectionDialog::OnCancel() {
-	bAccepted = false;
 	ResultTypes.Empty();
 
 	if (TSharedPtr<SWindow> Window = FSlateApplication::Get().FindWidgetWindow(SharedThis(this))) {

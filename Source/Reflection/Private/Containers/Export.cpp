@@ -51,8 +51,32 @@ UClass* FUObjectExport::GetClass() {
 		OutClass = FindClassByType(GetType().ToString());
 	}
 
-	if (Has("Next") || Has("SuperStruct")) {
-		OutClass = LoadClass(GetSuperStructJsonObject(GetProperties()));
+	if (Has("Next") || Has("SuperStruct") || Has("Super")) {
+		/* Parent refs appear at TWO levels and TWO spellings depending on the
+		 * exporter: top-level "SuperStruct" (BP_WorldPawn: Class'Character'),
+		 * top-level "Super" (BP_Stockpile: BP_ManagerialGame_C), or inside
+		 * Properties (the old GetSuperStructJsonObject path). Reading only
+		 * Properties.SuperStruct left BP_WorldPawn_C with a NULL parent and
+		 * faulted every compile that walked a member typed by it (08.24/25).
+		 * Resolve top-level first, then the Properties fallback, and build the
+		 * full <package>.<ClassName> path like ResolveObjectConstValue does. */
+		TSharedPtr<FJsonObject> SuperJson;
+		if (JsonObject->HasField(TEXT("SuperStruct"))) SuperJson = JsonObject->GetObjectField(TEXT("SuperStruct"));
+		else if (JsonObject->HasField(TEXT("Super"))) SuperJson = JsonObject->GetObjectField(TEXT("Super"));
+		else SuperJson = GetSuperStructJsonObject(GetProperties());
+
+		if (SuperJson.IsValid()) {
+			FString SuperName = SuperJson->GetStringField(TEXT("ObjectName"));
+			FString SuperPath = SuperJson->GetStringField(TEXT("ObjectPath"));
+
+			FString ShortName = StripObjectOuter(SuperName);
+			int32 Dot;
+			if (SuperPath.FindChar(TEXT('.'), Dot)) SuperPath = SuperPath.Left(Dot);
+
+			FString FullPath = SuperPath + TEXT(".") + ShortName;
+			OutClass = FindObject<UClass>(nullptr, *FullPath);
+			if (!OutClass) OutClass = LoadClass<UClass>(nullptr, *FullPath);
+		}
 	}
 
 	if (!OutClass) return nullptr;
