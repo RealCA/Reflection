@@ -1952,7 +1952,7 @@ bool FBlueprintBytecodeImporter::BuildLinearPath(const ParsedFunction& Ubergraph
             }
             else if (TokenName == TEXT("EX_PopExecutionFlow"))
             {
-                if (FlowStack.Num() > 0)
+                if (FlowStack.Num() > 1)
                 {
                     NextIdx = FlowStack.Pop();
                     /* Record the reconstructed target for the emit side - the
@@ -1961,7 +1961,15 @@ bool FBlueprintBytecodeImporter::BuildLinearPath(const ParsedFunction& Ubergraph
                 }
                 else
                 {
-                    NextIdx = NextSequentialStatementIndex(Ubergraph, CurIdx);
+                    /* Function-terminal pop: the only stack entry is the seeded
+                     * ubergraph invocation push, whose resume is the shared
+                     * Return epilogue - not this function's body. Stop instead
+                     * of resuming. (08.25: resuming chased cross-region gotos
+                     * into the Change Garment section - foreign Work Uniform /
+                     * Change Garment calls and a stray increment leaked into
+                     * Call for NPC interaction, and the loop's Completed chained
+                     * to the shared Return instead of its real continuation.) */
+                    break;
                 }
             }
             else if (TokenName == TEXT("EX_PopExecutionFlowIfNot"))
@@ -3210,6 +3218,10 @@ UEdGraphNode* FBlueprintBytecodeImporter::EmitStatement(FFunctionBuilder& Builde
     else if (Token == TEXT("EX_Let") || Token == TEXT("EX_LetObj") || Token == TEXT("EX_LetBool"))
     {
         return EmitLet(Builder, Stmt);
+    }
+    else if (Token == TEXT("EX_SetArray"))
+    {
+        return EmitSetArray(Builder, Stmt);
     }
     else if (Token == TEXT("EX_LetValueOnPersistentFrame"))
     {
@@ -7342,6 +7354,81 @@ UEdGraphNode* FBlueprintBytecodeImporter::EmitStructFieldRefWrite(FFunctionBuild
     return SetNode;
 }
 
+UEdGraphNode* FBlueprintBytecodeImporter::EmitSetArray(FFunctionBuilder& Builder, const FBytecodeToken& Stmt)
+{
+    /* UK2Node_MakeArray's compiled form: an EX_SetArray of the node's frame
+     * temp ("K2Node_MakeArray_Array"). Several SetArray sites = the same pure
+     * node evaluated in multiple contexts (loop gate + loop body), one editor
+     * node, one net - cache by the assigning temp name. (08.25: Call for NPC
+     * interaction had no handler at all - the MakeArray fell to the
+     * unhandled-token path, its consumers starved, and the loop's
+     * SetSkinnedAssetAndUpdate lost its Target.) */
+    if (!Stmt.JsonData.IsValid()) return nullptr;
+
+    FString TempName;
+    const TSharedPtr<FJsonObject>* AssigningProp = nullptr;
+    if (Stmt.JsonData->TryGetObjectField(TEXT("AssigningProperty"), AssigningProp) && AssigningProp && (*AssigningProp)->HasField(TEXT("Variable")))
+    {
+        const TSharedPtr<FJsonObject>& VarObj = (*AssigningProp)->GetObjectField(TEXT("Variable"));
+        const TSharedPtr<FJsonObject>* PropObj = nullptr;
+        if (VarObj.IsValid() && VarObj->TryGetObjectField(TEXT("Property"), PropObj) && PropObj)
+        {
+            TempName = (*PropObj)->GetStringField(TEXT("Name"));
+        }
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Elements = nullptr;
+    Stmt.JsonData->TryGetArrayField(TEXT("Elements"), Elements);
+
+    if (TempName.IsEmpty() || !Elements || Elements->Num() == 0)
+    {
+        UE_LOG(LogBlueprintBytecodeImporter, Warning, TEXT("EX_SetArray at si=%d: missing assigning temp or elements"), Stmt.StatementIndex);
+        return nullptr;
+    }
+
+    if (UK2Node_MakeArray** Existing = Builder.MakeArrayNodes.Find(TempName))
+    {
+        return *Existing;
+    }
+
+    UK2Node_MakeArray* MakeArrayNode = NewObject<UK2Node_MakeArray>(Builder.Graph);
+    MakeArrayNode->CreateNewGuid();
+    MakeArrayNode->SetFlags(RF_Transactional);
+    MakeArrayNode->NodePosX = Builder.NextNodeX - 200;
+    MakeArrayNode->NodePosY = Builder.NextNodeY;
+    Builder.NextNodeY += 120;
+    MakeArrayNode->NumInputs = Elements->Num();
+    Builder.Graph->AddNode(MakeArrayNode, true, true);
+    MakeArrayNode->AllocateDefaultPins();
+
+    for (int32 Idx = 0; Idx < Elements->Num(); ++Idx)
+    {
+        const TSharedPtr<FJsonObject> ElemObj = (*Elements)[Idx]->AsObject();
+        if (!ElemObj.IsValid()) continue;
+        FPinValue ElemValue = ResolveExpression(Builder, ElemObj);
+        UEdGraphPin* ElemPin = MakeArrayNode->FindPin(FName(*FString::Printf(TEXT("[%d]"), Idx)), EGPD_Input);
+        if (ElemPin && ElemValue.Pin)
+        {
+            ConnectPins(ElemValue.Pin, ElemPin);
+        }
+        else if (ElemPin && ElemValue.bConstant)
+        {
+            SetPinDefaultValueSafe(ElemPin, ElemValue.ConstString);
+        }
+    }
+
+    UEdGraphPin* OutputPin = MakeArrayNode->FindPin(TEXT("Array"), EGPD_Output);
+    if (OutputPin)
+    {
+        Builder.ProducerPins.Add(TempName, OutputPin);
+    }
+    Builder.MakeArrayNodes.Add(TempName, MakeArrayNode);
+
+    UE_LOG(LogBlueprintBytecodeImporter, Log, TEXT("  -> Emitted UK2Node_MakeArray (%s, %d element(s)) si=%d"),
+        *TempName, Elements->Num(), Stmt.StatementIndex);
+    return MakeArrayNode;
+}
+
 UEdGraphNode* FBlueprintBytecodeImporter::EmitLetValueOnPersistentFrame(FFunctionBuilder& Builder, const FBytecodeToken& Stmt)
 {
     const TSharedPtr<FJsonObject>& Json = Stmt.JsonData;
@@ -8919,6 +9006,7 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
     TArray<FEv> Pushes;
     TArray<int32> PlainPops;
     TArray<int32> PopIfNots;
+    TArray<int32> JumpIfNots;
     TArray<FEv> BackJumps;
 
     for (const FBytecodeToken* T : Ordered)
@@ -8939,6 +9027,16 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
         }
         else if ((Tok.Token == TEXT("EX_Jump") || Tok.Token == TEXT("EX_JumpIfNot")) && J.IsValid() && J->HasField(TEXT("CodeOffset")))
         {
+            /* Both conditional-exit spellings gate loops: the StandardMacro
+             * families compile their gate as EX_PopExecutionFlowIfNot, but a
+             * ForEachLoop over a pure expression chain (08.25: Call for NPC
+             * interaction, MakeArray->Length->Less) emits a bare EX_JumpIfNot.
+             * Without collecting it the gate scan reported "no conditional
+             * exit inside window" and the loop stayed flat. */
+            if (Tok.Token == TEXT("EX_JumpIfNot"))
+            {
+                JumpIfNots.Add(Tok.StatementIndex);
+            }
             const int32 Target = J->GetIntegerField(TEXT("CodeOffset"));
             if (Target < Tok.StatementIndex)
             {
@@ -8946,7 +9044,7 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
             }
         }
     }
-    if (BackJumps.Num() == 0 || PopIfNots.Num() == 0)
+    if (BackJumps.Num() == 0 || (PopIfNots.Num() == 0 && JumpIfNots.Num() == 0))
     {
         return;
     }
@@ -9004,9 +9102,10 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
             continue;
         }
 
-        /* Conditional exit between head and latch - take the LAST PopIfNot:
+        /* Conditional exit between head and latch - take the LAST conditional:
          * nested user branches inside the body can carry their own earlier
-         * PopIfNot (BeginPlay @177 vs the real gate @2031, diag_v2_trace). */
+         * gate (BeginPlay @177 vs the real gate @2031, diag_v2_trace). Both
+         * gate spellings count - see the collector comment above. */
         int32 CondLast = INDEX_NONE;
         for (int32 C : PopIfNots)
         {
@@ -9015,9 +9114,16 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
                 CondLast = C;
             }
         }
+        for (int32 C : JumpIfNots)
+        {
+            if (C >= HeadSi && C <= L.Si && (CondLast == INDEX_NONE || C > CondLast))
+            {
+                CondLast = C;
+            }
+        }
         if (CondLast == INDEX_NONE)
         {
-            UE_LOG(LogBlueprintBytecodeImporter, Log, TEXT("Loop cluster at si=%d: no conditional exit inside window, keeping flat"), HeadSi);
+            UE_LOG(LogBlueprintBytecodeImporter, Log, TEXT("Loop cluster at si=%d: no conditional exit inside window (PopExecutionFlowIfNot/JumpIfNot), keeping flat"), HeadSi);
             continue;
         }
 
@@ -9065,6 +9171,26 @@ void FBlueprintBytecodeImporter::DetectMacroLoops(FFunctionBuilder& Builder)
         Loop.BodyLast = BodyLast;
         Loop.CondLast = CondLast;
         Loop.LatchSi = L.Si;
+
+        /* A bare EX_JumpIfNot gate exits to ITS OWN CodeOffset, which is the
+         * loop's Completed continuation - NOT the outer push resume. The two
+         * only coincide for EX_PopExecutionFlowIfNot gates (the op pops to the
+         * outer resume as it jumps). (08.25: Call for NPC interaction's
+         * ForEachLoop chained Completed to the shared Return at 26406 and left
+         * its real continuation - the AssigneOrFindFocusIndexToNPC call at
+         * 20506 - unwired.) */
+        if (CondLast != INDEX_NONE)
+        {
+            for (const FBytecodeToken* T : Ordered)
+            {
+                if (T->StatementIndex == CondLast && T->Token == TEXT("EX_JumpIfNot")
+                    && T->JsonData.IsValid() && T->JsonData->HasField(TEXT("CodeOffset")))
+                {
+                    Loop.ExitAddr = T->JsonData->GetIntegerField(TEXT("CodeOffset"));
+                    break;
+                }
+            }
+        }
 
         /* Canonical temp-pair discovery INSIDE the cluster window: the
          * increment lets carry both canonical names in every corpus layout

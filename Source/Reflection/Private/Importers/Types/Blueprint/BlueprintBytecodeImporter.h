@@ -16,6 +16,7 @@
 #include "K2Node_Switch.h"
 #include "K2Node_Select.h"
 #include "K2Node_MakeStruct.h"
+#include "K2Node_MakeArray.h"
 #include "K2Node_BreakStruct.h"
 #include "K2Node_StructMemberGet.h"
 #include "K2Node_DynamicCast.h"
@@ -169,6 +170,7 @@ struct FFunctionBuilder {
     int32 NextNodeX = 0;                         // Next X position for new nodes
     int32 NextNodeY = 0;                         // Next Y position for new nodes
     TMap<FString, UK2Node_MakeStruct*> MakeStructNodes;   // struct type + run segment -> MakeStruct node
+TMap<FString, UK2Node_MakeArray*> MakeArrayNodes;     // SetArray temp (e.g. K2Node_MakeArray_Array) -> node; several EX_SetArray sites = one editor node re-evaluated
     int32 MakeStructRunId = 0;                           // per-construction-run counter (separate nodes per branch)
     TMap<FString, UK2Node_BreakStruct*> BreakStructNodes; // source struct temp var -> BreakStruct node
     /* Pure-read reuse (plan 013): one VariableGet node per variable per function
@@ -406,6 +408,7 @@ private:
     UEdGraphNode* EmitLet(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
     UEdGraphNode* EmitLetValueOnPersistentFrame(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
     UEdGraphNode* EmitMakeStructFieldSet(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
+UEdGraphNode* EmitSetArray(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
     UEdGraphNode* EmitStructFieldRefWrite(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
     UEdGraphNode* EmitJump(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
     UEdGraphNode* EmitJumpIfNot(FFunctionBuilder& Builder, const FBytecodeToken& Stmt);
